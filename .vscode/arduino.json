@@ -1,0 +1,19 @@
+{
+  "port": "COM10",
+  "configuration": "FlashSize=4M,PartitionScheme=ble_ota4m,DebugLevel=none",
+  "output": "build/c6-ble_ota4m",
+  "board": "esp32:esp32:XIAO_ESP32C6",
+  "programmer": "",
+  "useProgrammer": false,
+  "optimize_for_debug": false,
+  "configurationRequired": false,
+  "compile_profile": "",
+  "monitorPortSettings": {
+    "port": "",
+    "baudRate": 115200,
+    "lineEnding": "\r\n",
+    "dataBits": 8,
+    "parity": "none",
+    "stopBits": "one"
+  }
+}

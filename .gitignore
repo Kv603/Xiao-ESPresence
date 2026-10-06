@@ -1,0 +1,9 @@
+secrets.h
+build/
+*.pem
+*.key
+*.pfx
+*.bin
+*.elf
+*.map
+tools/hardware-private/
