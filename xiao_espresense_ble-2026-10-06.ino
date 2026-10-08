@@ -1,4 +1,6 @@
 #include <Arduino.h>
+
+
 #if !defined(CONFIG_IDF_TARGET_ESP32C6) || !defined(ARDUINO_XIAO_ESP32C6)
 #error "Select XIAO_ESP32C6 with Arduino-ESP32 3.3.8"
 #endif
@@ -171,6 +173,8 @@ static bool arduinoOtaStarted = false, arduinoOtaOwnsUpdate = false, arduinoOtaF
 #endif
 
 void SetMyHostname(const char *hostname) {
+  Serial.printf("\nHostname '%s'\n", hostname);
+
   WiFi.setHostname(hostname);
 #if ARDUINO_OTA
   ArduinoOTA.setHostname(hostname);
@@ -247,11 +251,38 @@ void setup() {
   settingsReady = commandQueue && loadSettings();
   if (!settingsReady) Serial.println("Settings unavailable/invalid; USB reprovisioning required (NVS preserved)");
   strlcpy(Room, settings.room.c_str(), sizeof Room);
+
+
+#if defined(CONFIG_IDF_TARGET_ESP32C6) || defined(ARDUINO_XIAO_ESP32C6)
+  //Seeed Studio XIAO ESP32-C6
+  Serial.print("Activating RF switch control...");
+#ifndef WIFI_ENABLE
+  Serial.print("missing WIFI_ENABLE definition, using pin 3...");
+#define WIFI_ENABLE 3
+#endif
+  digitalWrite(WIFI_ENABLE, LOW);  // digitalWrite(3, LOW); // Activate RF switch control
+  delay(100);
+#ifndef WIFI_ANT_CONFIG
+  Serial.println("missing WIFI_ANT_CONFIG definition, using pin 14...");
+#define WIFI_ANT_CONFIG 14
+#endif
+  pinMode(WIFI_ANT_CONFIG, OUTPUT);     // pinMode(14, OUTPUT);
+  digitalWrite(WIFI_ANT_CONFIG, HIGH);  // digitalWrite(14, HIGH); // Use external antenna
+  Serial.println(".  Now using external antenna");
+#else
+  Serial.println("No C6 selectable antenna defined!");
+#endif
+
   WiFi.mode(WIFI_STA);
 
   SetMyHostname(nodeId.c_str());
 
+#if !defined(ARDUINO_OTA) || !defined(ARDUINO_OTA_PASSWORD)
+  Serial.println("ARDUINO_OTA or ARDUINO_OTA_PASSWORD missing!");
+#endif
+
   WiFi.setAutoReconnect(true);
+  Serial.printf("Connecting WiFi to '%s'\n", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   setupBLE(false);
@@ -323,3 +354,4 @@ void loop() {
 
   delay(10);
 }
+///EOF///
