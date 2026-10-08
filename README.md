@@ -2,13 +2,14 @@
 
 Advertisement-only BLE tracking with Wi-Fi, MQTT/MQTTS, Preferences, MQTT-triggered HTTP/HTTPS OTA, and optional password-protected ArduinoOTA network uploads. No HTTP listener, filesystem, radar, Ethernet, web UI or LED strip is included.
 
-The hardcoded always-tracked iBeacon UUID **699ebc80-e1f3-11e3-9a0f-0cf3ee3bc012** is retained. Its devices bypass the configurable whitelist and 16 m cutoff, receive priority in the tracking table, and retain the latest-RSSI low-memory fallback. Configured aliases and matching IRKs still apply. MQTT settings cannot edit this built-in rule. The independent configurable whitelist holds 45 entries; the live tracking table holds 32 devices. BLE reports retain `espresense/devices/<device>/<room>` and the existing JSON format.
+Can hardcode an always-tracked UUID, such as iBeacon which bypasses the configurable whitelist and distance cutoff, receiving priority in the tracking table and retaining the latest-RSSI low-memory fallback. Configured aliases and matching IRKs still apply. MQTT settings cannot edit this built-in rule. The independent configurable whitelist holds 45 entries; the live tracking table holds 32 devices. BLE reporting follows the  `espresense/devices/<device>/<room>` topic format and JSON format.
 
 BLE declarations and shared types live in `Beacon_Scanner.h`; fingerprinting, filtering, Preferences validation, tracking and scanner implementation live in `Beacon_Scanner.ino`. Supporting documentation is in `docs/`.
 
 ## Build and partition installation
 
-Versions used: Arduino CLI, **Arduino-ESP32 3.3.8**, **NimBLE-Arduino 2.5.1**, **ArduinoJson 7.4.3**. ESP-MQTT, HTTP client, TLS and OTA come from the core. Keep your existing private `secrets.h`, or copy `secrets.example.header` to `secrets.h` and fill in credentials. Never commit flash backups or credentials.
+Versions used: Arduino CLI, **Arduino-ESP32 3.3.8**, **NimBLE-Arduino 2.5.1**, **ArduinoJson 7.4.3**. ESP-MQTT, HTTP client, TLS and OTA come from the core. 
+Copy `secrets.example.header` to `secrets.h` and fill in credentials.
 
 ```powershell
 arduino-cli core install esp32:esp32@3.3.8
