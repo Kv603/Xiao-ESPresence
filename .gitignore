@@ -1,6 +1,7 @@
 secrets.h
 build/
 *.pem
+*.ca
 *.key
 *.pfx
 *.bin

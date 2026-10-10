@@ -16,7 +16,7 @@ static std::atomic<unsigned> mqttSubscriptions{ 0 };
 static std::atomic<unsigned> droppedCommands{ 0 };
 static esp_mqtt_client_handle_t mqttHandle = nullptr;
 static control::Assembly incoming;
-static AppSettings transportSettings;  // Own certificate memory for client's full lifetime.
+static AppSettings transportSettings;     // Own certificate memory for client's full lifetime.
 static char selectedMqttServer[40] = {};  // 39 name bytes plus the terminating NUL.
 
 inline void selectMqttServer(const std::string &uri) {
@@ -26,10 +26,16 @@ inline void selectMqttServer(const std::string &uri) {
   // Keep bracketed IPv6 addresses intact, without their port.
   const size_t hostEnd = begin < uri.size() && uri[begin] == '[' ? uri.find(']', begin) : end;
   const size_t length = hostEnd == std::string::npos ? uri.size() - begin
-                       : hostEnd - begin + (uri[begin] == '[' ? 1 : 0);
+                                                     : hostEnd - begin + (uri[begin] == '[' ? 1 : 0);
   const size_t copied = length < sizeof selectedMqttServer ? length : sizeof selectedMqttServer - 1;
   uri.copy(selectedMqttServer, copied, begin);
   selectedMqttServer[copied] = '\0';
+  {
+    IPAddress test;
+    if (1 == Network.hostByName(selectedMqttServer, test))
+      Serial.printf("Using MQTT server '%s' at IP %s\n", selectedMqttServer, test.toString().c_str());
+    else Serial.printf("Could not resolve MQTT server at '%s' to an IP\n", selectedMqttServer);
+  }
 }
 
 struct MqttAdapter {
@@ -47,7 +53,12 @@ static void mqttEvent(void *, esp_event_base_t, int32_t eventId, void *eventData
   auto *e = static_cast<esp_mqtt_event_t *>(eventData);
   switch (eventId) {
     case MQTT_EVENT_CONNECTED:
-      Serial.printf("MQTT connected to '%s'\n", selectedMqttServer);
+      {
+        IPAddress test;
+        if (1 == Network.hostByName(selectedMqttServer, test))
+          Serial.printf("Connection to '%s' at IP %s established\n", selectedMqttServer, test.toString().c_str());
+        else Serial.printf("Could not resolve '%s' to an IP\n", selectedMqttServer);
+      }
       mqttOnline = true;
       mqttReselect = false;
       mqttAnnounce = true;
@@ -58,16 +69,27 @@ static void mqttEvent(void *, esp_event_base_t, int32_t eventId, void *eventData
       break;
     case MQTT_EVENT_DISCONNECTED:
       Serial.printf("MQTT to '%s' disconnected\n", selectedMqttServer);
-      mqttOnline = false;
-      mqttReselect = true;
-      incoming.reset();
+      {
+        IPAddress test;
+        if (1 == Network.hostByName(selectedMqttServer, test))
+          Serial.printf("Connection to '%s' at IP %s lost\n", selectedMqttServer, test.toString().c_str());
+        else Serial.printf("Could not resolve '%s' to an IP\n", selectedMqttServer);
+      }
       break;
+
     case MQTT_EVENT_SUBSCRIBED: ++mqttSubscriptions; break;
     case MQTT_EVENT_PUBLISHED: mqttLastAck = e->msg_id; break;
     case MQTT_EVENT_ERROR:
-      if (e->error_handle) Serial.printf("MQTT error type=%d transport=%d socket=%d refused=%d\n",
+      if (e->error_handle) Serial.printf("MQTT error type=%d transport=%d socket=%d refused=%d,server=%s\n",
                                          int(e->error_handle->error_type), int(e->error_handle->esp_tls_last_esp_err),
-                                         e->error_handle->esp_transport_sock_errno, int(e->error_handle->connect_return_code));
+                                         e->error_handle->esp_transport_sock_errno, int(e->error_handle->connect_return_code),
+                                         selectedMqttServer);
+      {
+        IPAddress test;
+        if (1 == Network.hostByName(selectedMqttServer, test))
+          Serial.printf("Connection to '%s' at IP %s error\n", selectedMqttServer, test.toString().c_str());
+        else Serial.printf("Could not resolve '%s' to an IP\n", selectedMqttServer);
+      }
       break;
     case MQTT_EVENT_DATA:
       if (incoming.add(e->topic, e->topic_len, e->data, e->data_len, e->current_data_offset, e->total_data_len, e->retain)) {
@@ -104,6 +126,7 @@ inline bool startMqtt(const AppSettings &s) {
   if (s.uri.compare(0, 8, "mqtts://") == 0) {
     if (s.mqttCa.empty() || time(nullptr) < 1704067200) return false;
     config.broker.verification.certificate = transportSettings.mqttCa.c_str();
+    config.broker.verification.skip_cert_common_name_check=true;
   }
   config.credentials.client_id = nodeId.c_str();
   config.credentials.username = transportSettings.user.c_str();

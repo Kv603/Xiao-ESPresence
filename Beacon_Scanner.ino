@@ -773,7 +773,7 @@ void receive(const NimBLEAdvertisedDevice *d) {
           v.effective, (unsigned long)ESP.getFreeHeap());
   }
   if (alwaysTrack(v.fp)) {
-    log_d("BLE tracked: mac=%s id=%s samples=%lu RSSI=%.0f distance=%.2f MQTT=%s",
+    log_i("BLE tracked: mac=%s id=%s samples=%lu RSSI=%.0f distance=%.2f MQTT=%s",
           v.fp.mac, v.effective, (unsigned long)v.samples, v.raw, v.distance,
           mqttClient.connected() ? "connected" : "disconnected");
   }

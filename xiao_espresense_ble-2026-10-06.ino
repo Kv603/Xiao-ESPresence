@@ -1,9 +1,11 @@
 #include <Arduino.h>
+constexpr char FIRMWARE_VERSION[] = "c6-ble-1.0.3";
 
-
+// Extend this if you confirm additional supported boards
 #if !defined(CONFIG_IDF_TARGET_ESP32C6) || !defined(ARDUINO_XIAO_ESP32C6)
 #error "Select XIAO_ESP32C6 with Arduino-ESP32 3.3.8"
 #endif
+
 #include <WiFi.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
@@ -16,7 +18,6 @@
 #include "MQTT_Transport.h"
 
 #define SCAN_BLE
-constexpr char FIRMWARE_VERSION[] = "c6-ble-1.0.0";
 std::atomic<bool> ProcessingOTA{ false };
 char Room[64] = {};
 unsigned long Publish_BLE_Attempts = 0, Total_BLE_Records_Last_Pub = 0, Skipped_BLE_Records_Last_Pub = 0;
@@ -41,8 +42,7 @@ static AppSettings mqttSettingsForWifi(bool retrySelection) {
   AppSettings selected = settings;
   // Try explicit/saved/legacy settings first. If they fail, select a configured
   // broker for the current subnet without changing the persisted settings.
-  const bool bootstrap = !hasSavedConnectionSettings && std::string(TRACKER_MQTT_URI).empty() &&
-                         settings.uri == std::string("mqtt://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT);
+  const bool bootstrap = !hasSavedConnectionSettings && std::string(TRACKER_MQTT_URI).empty() && settings.uri == std::string("mqtt://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT);
   if (!retrySelection && !bootstrap) return selected;
   const char *server = MQTT_SERVER;
 #if defined(MQTT_SERVER_BACKUP) && defined(TESTNETPREFIX)
@@ -249,6 +249,7 @@ static void serviceArduinoOta() {
   ArduinoOTA.handle();
   // Error callbacks can run before the core finishes cleanup. Resume afterwards.
   if (arduinoOtaFailed) {
+    Serial.println("Failed OTA update!");
     Update.abort();
     arduinoOtaFailed = arduinoOtaOwnsUpdate = false;
     ProcessingOTA = false;
@@ -269,6 +270,11 @@ void setup() {
   nodeId = std::string("c6-") + id;
   controlPrefix = "bletracker/" + nodeId;
   Serial.printf("BOOT %s %s flash=%lu\n", FIRMWARE_VERSION, nodeId.c_str(), (unsigned long)ESP.getFlashChipSize());
+
+#if defined(ARDUINO_XIAO_ESP32C6)
+  Serial.println("Running on Xiao ESP32C6");
+#endif
+
   printPartitions();
   commandQueue = xQueueCreate(2, sizeof(Command *));
   settingsReady = commandQueue && loadSettings();
@@ -307,7 +313,8 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t) {
     wifiConnected = true;
-  }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  },
+               ARDUINO_EVENT_WIFI_STA_GOT_IP);
   Serial.printf("Connecting WiFi to '%s'\n", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -362,11 +369,12 @@ void loop() {
     processCommand(*owned);
   }
   if (!ProcessingOTA) {
-    doBLE();
     if (uint32_t(millis() - lastActiveScan) > 997000) {
       requestActiveBLEScan();
       lastActiveScan = millis();
     }
+    doBLE();
+    delay(1000);
   }
   if (uint32_t(millis() - lastDiagnostics) >= 61000) {
     Serial.printf("HEALTH wifi=%d mqtt=%d heap=%lu min_heap=%lu dropped=%u\n", WiFi.status() == WL_CONNECTED,
