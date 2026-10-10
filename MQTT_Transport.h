@@ -10,12 +10,27 @@ struct Command {
 static QueueHandle_t commandQueue = nullptr;
 static std::string nodeId, controlPrefix;
 static std::atomic<bool> mqttOnline{ false }, mqttAnnounce{ false };
+static std::atomic<bool> mqttReselect{ false };
 static std::atomic<int> mqttLastAck{ -1 };
 static std::atomic<unsigned> mqttSubscriptions{ 0 };
 static std::atomic<unsigned> droppedCommands{ 0 };
 static esp_mqtt_client_handle_t mqttHandle = nullptr;
 static control::Assembly incoming;
 static AppSettings transportSettings;  // Own certificate memory for client's full lifetime.
+static char selectedMqttServer[40] = {};  // 39 name bytes plus the terminating NUL.
+
+inline void selectMqttServer(const std::string &uri) {
+  const size_t scheme = uri.find("://");
+  const size_t begin = scheme == std::string::npos ? 0 : scheme + 3;
+  const size_t end = uri.find_first_of(":/", begin);
+  // Keep bracketed IPv6 addresses intact, without their port.
+  const size_t hostEnd = begin < uri.size() && uri[begin] == '[' ? uri.find(']', begin) : end;
+  const size_t length = hostEnd == std::string::npos ? uri.size() - begin
+                       : hostEnd - begin + (uri[begin] == '[' ? 1 : 0);
+  const size_t copied = length < sizeof selectedMqttServer ? length : sizeof selectedMqttServer - 1;
+  uri.copy(selectedMqttServer, copied, begin);
+  selectedMqttServer[copied] = '\0';
+}
 
 struct MqttAdapter {
   bool connected() const {
@@ -32,7 +47,9 @@ static void mqttEvent(void *, esp_event_base_t, int32_t eventId, void *eventData
   auto *e = static_cast<esp_mqtt_event_t *>(eventData);
   switch (eventId) {
     case MQTT_EVENT_CONNECTED:
+      Serial.printf("MQTT connected to '%s'\n", selectedMqttServer);
       mqttOnline = true;
+      mqttReselect = false;
       mqttAnnounce = true;
       mqttSubscriptions = 0;
       esp_mqtt_client_subscribe(mqttHandle, (controlPrefix + "/config/set").c_str(), 1);
@@ -40,7 +57,9 @@ static void mqttEvent(void *, esp_event_base_t, int32_t eventId, void *eventData
       esp_mqtt_client_subscribe(mqttHandle, (controlPrefix + "/ota/set").c_str(), 1);
       break;
     case MQTT_EVENT_DISCONNECTED:
+      Serial.printf("MQTT to '%s' disconnected\n", selectedMqttServer);
       mqttOnline = false;
+      mqttReselect = true;
       incoming.reset();
       break;
     case MQTT_EVENT_SUBSCRIBED: ++mqttSubscriptions; break;
@@ -71,6 +90,7 @@ inline void stopMqtt() {
   }
   mqttOnline = false;
   mqttAnnounce = false;
+  mqttReselect = false;
   mqttLastAck = -1;
   mqttSubscriptions = 0;
   incoming.reset();
@@ -78,6 +98,7 @@ inline void stopMqtt() {
 inline bool startMqtt(const AppSettings &s) {
   stopMqtt();
   transportSettings = s;
+  selectMqttServer(transportSettings.uri);
   esp_mqtt_client_config_t config{};
   config.broker.address.uri = transportSettings.uri.c_str();
   if (s.uri.compare(0, 8, "mqtts://") == 0) {

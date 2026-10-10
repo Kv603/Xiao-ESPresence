@@ -34,7 +34,30 @@ std::string hostName() {
 
 
 static bool settingsReady = false;
+static std::atomic<bool> wifiConnected{ false };
+static bool retryMqttSelection = false;
 static uint32_t nextConnect = 0, lastActiveScan = 0, lastDiagnostics = 0;
+static AppSettings mqttSettingsForWifi(bool retrySelection) {
+  AppSettings selected = settings;
+  // Try explicit/saved/legacy settings first. If they fail, select a configured
+  // broker for the current subnet without changing the persisted settings.
+  const bool bootstrap = !hasSavedConnectionSettings && std::string(TRACKER_MQTT_URI).empty() &&
+                         settings.uri == std::string("mqtt://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT);
+  if (!retrySelection && !bootstrap) return selected;
+  const char *server = MQTT_SERVER;
+#if defined(MQTT_SERVER_BACKUP) && defined(TESTNETPREFIX)
+  if (WiFi.localIP().toString().startsWith(TESTNETPREFIX)) server = MQTT_SERVER_BACKUP;
+#endif
+  const size_t begin = selected.uri.find("://") + 3;
+  size_t end = selected.uri.find(':', begin);
+  if (selected.uri[begin] == '[') {
+    end = selected.uri.find(']', begin);
+    if (end != std::string::npos) ++end;
+  }
+  // Preserve the scheme, port, credentials and CA; TLS retries stay on TLS.
+  selected.uri.replace(begin, (end == std::string::npos ? selected.uri.size() : end) - begin, server);
+  return selected;
+}
 static bool networkChanged(const AppSettings &a, const AppSettings &b) {
   return a.uri != b.uri || a.user != b.user || a.password != b.password || a.mqttCa != b.mqttCa;
 }
@@ -282,6 +305,9 @@ void setup() {
 #endif
 
   WiFi.setAutoReconnect(true);
+  WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t) {
+    wifiConnected = true;
+  }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
   Serial.printf("Connecting WiFi to '%s'\n", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -301,17 +327,19 @@ void loop() {
     printPartitions();
   }
   TimeNow = time(nullptr);
-#if defined(MQTT_SERVER_BACKUP) && defined(TESTNETPREFIX)
-  // Preserve the private configuration's existing LAN bootstrap fallback. Explicit
-  // URI and persisted settings always win; this is not a TLS downgrade path.
-  if (settingsReady && !hasSavedConnectionSettings && std::string(TRACKER_MQTT_URI).empty() && !mqttOnline && millis() > 30000 && WiFi.status() == WL_CONNECTED && WiFi.localIP().toString().startsWith(TESTNETPREFIX) && settings.uri == std::string("mqtt://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT)) {
-    settings.uri = std::string("mqtt://") + MQTT_SERVER_BACKUP + ":" + std::to_string(MQTT_PORT);
+  if (settingsReady && !ProcessingOTA && WiFi.status() == WL_CONNECTED && wifiConnected.exchange(false)) {
+    // Stop the old client before changing the name used by its event callback.
     stopMqtt();
-    Serial.println("Using configured LAN bootstrap broker");
+    retryMqttSelection = false;
+    nextConnect = millis();
+  } else if (settingsReady && !ProcessingOTA && WiFi.status() == WL_CONNECTED && mqttReselect.exchange(false)) {
+    stopMqtt();
+    retryMqttSelection = true;
+    nextConnect = millis() + 5000;
   }
-#endif
   if (settingsReady && !ProcessingOTA && WiFi.status() == WL_CONNECTED && !mqttHandle && int32_t(millis() - nextConnect) >= 0) {
-    startMqtt(settings);
+    const AppSettings selected = mqttSettingsForWifi(retryMqttSelection);
+    if (!startMqtt(selected)) retryMqttSelection = true;
     nextConnect = millis() + 5000;
   }
   if (mqttAnnounce.exchange(false)) {
@@ -327,7 +355,6 @@ void loop() {
       if (!deserializeJson(previous, saved)) doc["last_update"].set(previous.as<JsonVariantConst>());
     }
     publishJson("/ota/status", doc);
-    Serial.printf("MQTT connected heap=%lu\n", (unsigned long)ESP.getFreeHeap());
   }
   Command *command = nullptr;
   if (commandQueue && xQueueReceive(commandQueue, &command, 0) == pdTRUE) {
