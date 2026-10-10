@@ -795,9 +795,13 @@ bool hasTrackableIdentity(const Snapshot &v) {
   return !v.privateIdentityMissing;
 }
 
-bool eligible(const Snapshot &v) {
+bool reportable(const Snapshot &v) {
   // Configured identities take the place of upstream known-IRK/alias precedence.
-  return v.valid && v.pending && hasTrackableIdentity(v) && std::isfinite(v.distance) && (alwaysTrack(v.fp) || ((v.token || v.fp.priority > 1) && v.distance <= 16));
+  return v.valid && hasTrackableIdentity(v) && std::isfinite(v.distance) && (alwaysTrack(v.fp) || ((v.token || v.fp.priority > 1) && v.distance <= 16));
+}
+
+bool eligible(const Snapshot &v) {
+  return v.pending && reportable(v);
 }
 
 bool due(const Snapshot &v, uint64_t now) {
@@ -815,8 +819,7 @@ bool publish(const Snapshot &v) {
   }
   if (!mqttClient.connected()) return false;
 
-  std::string room = normalize(Room, '_');
-  if (room.empty()) room = normalize(hostName(), '_');
+  const std::string room = bleRoomTopicName(Room, hostName());
   char topic[256], payload[1024];
   int n = snprintf(topic, sizeof topic, "espresense/devices/%s/%s", v.effective, room.c_str());
   if (n < 0 || size_t(n) >= sizeof topic) return false;
@@ -1148,6 +1151,26 @@ boolean doBLE() {
 #endif // BEACON_CORE_ONLY
 
 #ifndef BEACON_CORE_ONLY
+std::string bleRoomTopicName(const std::string &room, const std::string &node) {
+  std::string normalized = bletrack::normalize(room, '_');
+  return normalized.empty() ? bletrack::normalize(node, '_') : normalized;
+}
+
+bool bleReportableDeviceCount(uint32_t &count) {
+  using namespace bletrack;
+  Lock state(stateMutex);
+  if (!state || !runtime) return false;
+  const uint32_t now = millis();
+  uint32_t recent = 0;
+  for (auto &t : runtime->devices) {
+    if (!t.view.valid || uint32_t(now - t.view.last) > 15000) continue;
+    if (t.view.sequence != t.view.computedSequence) calculate(t, now);
+    if (reportable(t.view)) ++recent;
+  }
+  count = recent;
+  return true;
+}
+
 bool bleScannerIsRunning() {
   return bletrack::scanner && bletrack::scanner->isScanning();
 }

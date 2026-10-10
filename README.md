@@ -61,6 +61,14 @@ Serial `?` reports firmware, network state, heap and actual partition addresses.
 
 ## MQTT settings
 
+The node also discovers one Home Assistant sensor named **Tracked BLE devices**. Its retained configuration is published at `homeassistant/sensor/espresense_<nodeId>/<room>/config`; its non-retained decimal count is published at `devices/espresense_<nodeId>/<room>/count`. The room uses the same normalization as BLE topics, falling back to the normalized node ID. The entity's unique ID stays constant when the room changes.
+
+The count includes each valid tracking entry seen within the last 15 seconds that meets the existing BLE identity and distance rules, including the built-in iBeacon exemption. It includes readings already published and excludes stale or otherwise unreportable entries. Count changes publish promptly, at most once per second; unchanged counts refresh every **31 seconds**. This adds a count sensor without changing BLE reporting intervals.
+
+Availability uses `devices/espresense_<nodeId>/<room>/status`. Each successful MQTT connection clears any retained status and publishes non-retained `online`. A retained `offline` LWT is configured before connecting. Orderly shutdown publishes the same retained `offline` and waits up to two seconds for its acknowledgment before stopping (publication still uses the existing network timeout). Discovery, counts, and availability use QoS 1. Count updates also repeat non-retained `online`.
+
+The node subscribes to the default Home Assistant birth topic, `homeassistant/status`. Receiving `online`, including a retained birth message, schedules discovery and current count/availability replay. Discovery is deferred until MQTT connects and repeated on reconnection. Room changes restart the MQTT client to update its LWT, clear the old room's retained discovery on the active broker, and announce the replacement after settings are committed. Failed candidates retain the previous configuration. Switching brokers does not reconnect to the old broker solely to remove discovery.
+
 The stable control prefix is `bletracker/c6-<12 lowercase Wi-Fi MAC hex digits>`, printed at boot. It does not change with room/label settings. Use broker ACLs so only authorized operators can publish control commands. MQTT over plain TCP and HTTP downloads remain available for trusted networks; SHA-256 checks integrity and does not authenticate a command. TLS modes require CA trust and a synchronized clock; there is no downgrade or `setInsecure` path.
 
 Publish JSON to these topics, always **non-retained**:
@@ -131,7 +139,15 @@ An interrupted download leaves the active application selected. This does not pr
 
 ## Tests
 
-`tests/Run.ps1` runs the preserved BLE core/runtime regression suite, 12,000 RSSI equivalence observations, configuration persistence/failure tests and MQTT fragment/URL validation. The current tests live outside build output. Old reports in `docs/` and old `build/` artifacts describe the previous multi-board/web firmware.
+`tests/Run.ps1` runs the preserved BLE core/runtime regression suite, 12,000 RSSI equivalence observations, configuration persistence/failure tests and MQTT fragment/URL validation. It also tests the 15-second reportable-device count, count coalescing and refresh, discovery/availability messages, subscription acknowledgments, shutdown and room-change rollback. The current tests live outside build output. Old reports in `docs/` and old `build/` artifacts describe the previous multi-board/web firmware.
+
+`tests/Test-MqttBroker.mjs` exercises the production MQTT lifecycle and settings transaction through a host adapter against a temporary loopback broker. It verifies retained discovery, automatic LWT after a dropped connection, reconnection, Home Assistant birth replay, room discovery replacement and manual shutdown. It uses simulated BLE counts and an MQTT.js network adapter; physical-board and Home Assistant UI validation remain separate. Run the native tests first to generate the shared fixtures:
+
+```powershell
+./tests/Run.ps1
+npm install --prefix build/mqtt-broker-private --no-audit --no-fund --ignore-scripts aedes@1.2.0 mqtt@5.16.0
+node tests/Test-MqttBroker.mjs
+```
 
 `tools/Test-Hardware.mjs` uses the connected board plus temporary TCP/TLS MQTT and HTTP/HTTPS servers on a workstation reachable by the board. It checks maximum whitelist writes, revision/retained-message handling, malformed/interrupted updates and alternating successful HTTP/HTTPS updates. It restores the original broker and temporary entries; a full flash backup provides additional recovery. It refuses existing CA overrides that its redacted state cannot restore. See `docs/C6_VALIDATION.md` for actual results and remaining physical tests. Server certificates/keys and all hardware outputs belong under ignored `build/` directories.
 
