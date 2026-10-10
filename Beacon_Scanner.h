@@ -11,6 +11,8 @@ void pauseBLEForOTA();
 void requestActiveBLEScan();
 bool bleScannerIsRunning();
 bool bleConfigurationRevision(uint32_t &revision);
+bool bleReportableDeviceCount(uint32_t &count);
+std::string bleRoomTopicName(const std::string &room, const std::string &node);
 bool appendBLEConfigurationState(JsonDocument &doc);
 const char *editBLEConfiguration(JsonVariantConst command);
 bool prepareForFirmwareUpdate();

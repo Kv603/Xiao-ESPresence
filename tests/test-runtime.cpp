@@ -36,7 +36,46 @@ static void saveConfiguration(Edit *r){
 }
 
 int main(){
+    uint32_t recent = 99;
+    assert(!bleReportableDeviceCount(recent) && recent == 99);
     assert(initialize());setupBLE(false);
+    assert(bleReportableDeviceCount(recent) && recent == 0);
+    assert(bleRoomTopicName("Living Room", "c6-test") == "living_room");
+    assert(bleRoomTopicName(" +/# ", "c6-test") == "c6_test");
+    {
+        const uint32_t savedClock = clockMs;
+        clockMs = 20000;
+        Snapshot ordinary;
+        ordinary.valid = true; ordinary.pending = false; ordinary.distance = 1;
+        ordinary.fp.priority = 2; ordinary.last = 5000;
+        runtime->devices[0].view = ordinary;
+        assert(bleReportableDeviceCount(recent) && recent == 1);
+        ++clockMs; assert(bleReportableDeviceCount(recent) && recent == 0);
+        runtime->devices[0].view.last = clockMs;
+        runtime->devices[0].view.distance = 17;
+        assert(bleReportableDeviceCount(recent) && recent == 0);
+        auto &v = runtime->devices[0].view;
+        copy(v.fp.type, "iBeacon"); copy(v.fp.beacon, ALWAYS_TRACK_IBEACON_UUID);
+        assert(bleReportableDeviceCount(recent) && recent == 1);
+        v.privateIdentityMissing = true;
+        assert(bleReportableDeviceCount(recent) && recent == 0);
+        v.privateIdentityMissing = false; v.distance = NAN;
+        assert(bleReportableDeviceCount(recent) && recent == 0);
+        v = ordinary; v.last = clockMs; v.fp.priority = 1;
+        assert(bleReportableDeviceCount(recent) && recent == 0);
+        v.token = 1; v.distance = 16;
+        assert(bleReportableDeviceCount(recent) && recent == 1);
+        v.token = 0; v.fp.priority = 2; v.distance = 100;
+        assert(runtime->devices[0].filter.addMeasurement(-40, clockMs));
+        v.sequence = 1; v.computedSequence = 0;
+        assert(bleReportableDeviceCount(recent) && recent == 1 && v.computedSequence == 1);
+        stateMutex->locked = true; recent = 99;
+        assert(!bleReportableDeviceCount(recent) && recent == 99);
+        stateMutex->locked = false;
+        v.last = UINT32_MAX - 100; clockMs = 100;
+        assert(bleReportableDeviceCount(recent) && recent == 1);
+        clearTracked(); clockMs = savedClock;
+    }
     assert(!scanner->active&&!scanner->duplicate&&scanner->maxResults==0);
     doBLE();assert(scanner->isScanning());
     requestActiveBLEScan();assert(!scanner->active);doBLE();

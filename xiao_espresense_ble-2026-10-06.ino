@@ -59,7 +59,8 @@ static AppSettings mqttSettingsForWifi(bool retrySelection) {
   return selected;
 }
 static bool networkChanged(const AppSettings &a, const AppSettings &b) {
-  return a.uri != b.uri || a.user != b.user || a.password != b.password || a.mqttCa != b.mqttCa;
+  return a.uri != b.uri || a.user != b.user || a.password != b.password || a.mqttCa != b.mqttCa ||
+         bleRoomTopicName(a.room, nodeId) != bleRoomTopicName(b.room, nodeId);
 }
 static void result(const std::string &id, const char *status, const char *detail) {
   JsonDocument doc;
@@ -145,6 +146,7 @@ static void processSettings(JsonVariantConst command, const std::string &id) {
     result(id, "error", "NVS write failed; previous settings retained");
     return;
   }
+  retireHaDiscovery(settings, candidate);
   settings = std::move(candidate);
   hasSavedConnectionSettings = true;
   strlcpy(Room, settings.room.c_str(), sizeof Room);
@@ -374,6 +376,7 @@ void loop() {
       lastActiveScan = millis();
     }
     doBLE();
+    serviceHomeAssistant(settings.label, FIRMWARE_VERSION);
     delay(1000);
   }
   if (uint32_t(millis() - lastDiagnostics) >= 61000) {
