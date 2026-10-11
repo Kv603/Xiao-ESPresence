@@ -3,10 +3,11 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include "secrets.h"
 
 namespace homeassistant {
 struct Topics {
-  std::string device, discovery, count, status;
+  std::string device, discovery, count, status, bootreason;
   Topics() = default;
   Topics(const std::string &node, const std::string &room) {
     device = "espresense_" + node;
@@ -14,6 +15,7 @@ struct Topics {
     const std::string base = "devices/" + device + "/" + room;
     count = base + "/count";
     status = base + "/status";
+    bootreason = status + "/bootreason";
   }
 };
 

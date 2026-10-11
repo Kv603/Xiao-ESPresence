@@ -1,5 +1,5 @@
 #include <Arduino.h>
-constexpr char FIRMWARE_VERSION[] = "c6-ble-1.0.3";
+constexpr char FIRMWARE_VERSION[] = "c6-ble1.1.5";
 
 // Extend this if you confirm additional supported boards
 #if !defined(CONFIG_IDF_TARGET_ESP32C6) || !defined(ARDUINO_XIAO_ESP32C6)
@@ -16,6 +16,7 @@ constexpr char FIRMWARE_VERSION[] = "c6-ble-1.0.3";
 #include <time.h>
 #include "App_Settings.h"
 #include "MQTT_Transport.h"
+#include "secrets.h"
 
 #define SCAN_BLE
 std::atomic<bool> ProcessingOTA{ false };
@@ -38,15 +39,31 @@ static bool settingsReady = false;
 static std::atomic<bool> wifiConnected{ false };
 static bool retryMqttSelection = false;
 static uint32_t nextConnect = 0, lastActiveScan = 0, lastDiagnostics = 0;
+
+
+
 static AppSettings mqttSettingsForWifi(bool retrySelection) {
   AppSettings selected = settings;
   // Try explicit/saved/legacy settings first. If they fail, select a configured
   // broker for the current subnet without changing the persisted settings.
-  const bool bootstrap = !hasSavedConnectionSettings && std::string(TRACKER_MQTT_URI).empty() && settings.uri == std::string("mqtt://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT);
+  bool bootstrap = false;
+  unsigned int port = MQTT_PORT;
+
+  if (port != 8883) {
+    bootstrap = !hasSavedConnectionSettings && std::string(TRACKER_MQTT_URI).empty() && settings.uri == std::string("mqtt://") + MQTT_SERVER + ":" + std::to_string(port);
+    log_w("Using cleartext MQTT");
+  } else {
+    bootstrap = !hasSavedConnectionSettings && std::string(TRACKER_MQTT_URI).empty() && settings.uri == std::string("mqtts://") + MQTT_SERVER + ":" + std::to_string(port);
+    log_i("Using encrypted MQTTS");
+  }
+
   if (!retrySelection && !bootstrap) return selected;
   const char *server = MQTT_SERVER;
 #if defined(MQTT_SERVER_BACKUP) && defined(TESTNETPREFIX)
-  if (WiFi.localIP().toString().startsWith(TESTNETPREFIX)) server = MQTT_SERVER_BACKUP;
+  if (WiFi.localIP().toString().startsWith(TESTNETPREFIX)) {
+    server = MQTT_SERVER_BACKUP;
+    port = MQTT_PORT_CLEARTEXT;
+  }
 #endif
   const size_t begin = selected.uri.find("://") + 3;
   size_t end = selected.uri.find(':', begin);
@@ -56,11 +73,14 @@ static AppSettings mqttSettingsForWifi(bool retrySelection) {
   }
   // Preserve the scheme, port, credentials and CA; TLS retries stay on TLS.
   selected.uri.replace(begin, (end == std::string::npos ? selected.uri.size() : end) - begin, server);
+  log_i("Selected MQTT uri '%s'", selected.uri.c_str());
   return selected;
 }
+
+
+
 static bool networkChanged(const AppSettings &a, const AppSettings &b) {
-  return a.uri != b.uri || a.user != b.user || a.password != b.password || a.mqttCa != b.mqttCa ||
-         bleRoomTopicName(a.room, nodeId) != bleRoomTopicName(b.room, nodeId);
+  return a.uri != b.uri || a.user != b.user || a.password != b.password || a.mqttCa != b.mqttCa || bleRoomTopicName(a.room, nodeId) != bleRoomTopicName(b.room, nodeId);
 }
 static void result(const std::string &id, const char *status, const char *detail) {
   JsonDocument doc;
@@ -90,7 +110,8 @@ static void state(const std::string &id) {
   if (!doc.overflowed() && mqttHandle && mqttOnline) {
     std::string payload;
     serializeJson(doc, payload);
-    esp_mqtt_client_publish(mqttHandle, (controlPrefix + "/config/state").c_str(), payload.c_str(), int(payload.size()), 0, false);
+    if (esp_mqtt_client_publish(mqttHandle, (controlPrefix + "/config/state").c_str(), payload.c_str(), int(payload.size()), 0, false))
+      log_i("Published '%s' to %s", payload.c_str(), (controlPrefix + "/config/state").c_str());
   }
 }
 static bool waitForConnection(uint32_t timeout) {
@@ -154,8 +175,10 @@ static void processSettings(JsonVariantConst command, const std::string &id) {
 }
 static void processCommand(const Command &command) {
   JsonDocument doc;
+  log_d("processCommand('%s') payload '%s'", command.topic.c_str(), command.payload.c_str());
   if (deserializeJson(doc, command.payload, DeserializationOption::NestingLimit(4)) || !doc.is<JsonObject>()) {
     result("", "error", "invalid JSON");
+    log_w("Invalid JSON in '%s'", command.payload.c_str());
     return;
   }
   const std::string id = doc["id"] | "";
@@ -273,9 +296,10 @@ void setup() {
   controlPrefix = "bletracker/" + nodeId;
   Serial.printf("BOOT %s %s flash=%lu\n", FIRMWARE_VERSION, nodeId.c_str(), (unsigned long)ESP.getFlashChipSize());
 
-#if defined(ARDUINO_XIAO_ESP32C6)
+#if defined(CONFIG_IDF_TARGET_ESP32C6) || defined(ARDUINO_XIAO_ESP32C6)
   Serial.println("Running on Xiao ESP32C6");
 #endif
+
 
   printPartitions();
   commandQueue = xQueueCreate(2, sizeof(Command *));
@@ -317,6 +341,16 @@ void setup() {
     wifiConnected = true;
   },
                ARDUINO_EVENT_WIFI_STA_GOT_IP);
+
+
+#ifdef LED_BUILTIN
+  pinMode(LED_BUILTIN, OUTPUT);
+  Serial.printf("Using LED on GPIO%d\n", LED_BUILTIN);
+  digitalWrite(LED_BUILTIN, LED_BUILTIN_OFF);
+#else
+  Serial.println("No LED_BUILTIN");
+#endif
+
   Serial.printf("Connecting WiFi to '%s'\n", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -385,11 +419,12 @@ void loop() {
     lastDiagnostics = millis();
 
     if (mqttOnline) {
-      const char *myip = WiFi.localIP().toString().c_str();
-      esp_mqtt_client_publish(mqttHandle, (controlPrefix + "/config/ip").c_str(), myip, strlen(myip), 0, false);
+      esp_mqtt_client_publish(mqttHandle, (controlPrefix + "/config/ip").c_str(),
+                              WiFi.localIP().toString().c_str(), WiFi.localIP().toString().length(), 0, false);
     }
   }
 
   delay(10);
 }
+
 ///EOF///

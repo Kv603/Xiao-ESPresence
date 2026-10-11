@@ -6,6 +6,7 @@
 #include "Control_Core.h"
 #include "Beacon_Scanner.h"
 #include "Home_Assistant.h"
+#include "secrets.h"
 
 struct Command {
   std::string topic, payload;
@@ -36,6 +37,58 @@ static std::vector<RetiredDiscovery> haRetiredDiscovery;
 static uint32_t haNextCleanup = 0;
 inline bool waitForAck(int id, uint32_t timeout = 5000);
 
+
+
+////////////////////////////////////////////
+inline std::string logbootreason(void) {
+  std::string BootReasonText = "Unknown Reboot";
+  esp_reset_reason_t reason = esp_reset_reason();
+  switch (reason) {
+    case ESP_RST_POWERON:
+      BootReasonText = "Power-on boot";
+      log_w("Reset due to power-on event");
+      break;
+    case ESP_RST_SW:
+      BootReasonText = "Soft Reboot";
+      log_w("Software reset via esp_restart");
+      break;
+    case ESP_RST_PANIC:
+      BootReasonText = "Panic Reboot";
+      log_w("Software reset due to exception/panic");
+      break;
+    case ESP_RST_INT_WDT:
+      BootReasonText = "IRQ Watchdog";
+      log_w("Reset (software or hardware) due to interrupt watchdog");
+      break;
+    case ESP_RST_TASK_WDT:
+      BootReasonText = "Task Watchdog";
+      log_w("Reset due to task watchdog");
+      break;
+    case ESP_RST_WDT:
+      BootReasonText = "Other Watchdog";
+      log_w("Reset due to other watchdogs");
+      break;
+    case ESP_RST_DEEPSLEEP:
+      BootReasonText = "Deep Reboot";
+      log_w("Reset after exiting deep sleep mode");
+      break;
+    case ESP_RST_BROWNOUT:
+      BootReasonText = "Brownout Boot";
+      log_w("Brownout reset (software or hardware)");
+      break;
+    case ESP_RST_SDIO:
+      BootReasonText = "Reset over SDIO";
+      log_w("Reset over SDIO");
+      break;
+
+    default:
+      break;
+  }
+  log_w("reboot reason '%s'", BootReasonText.c_str());
+  return (BootReasonText);
+}
+
+////////////////////////////////////////////////
 inline int publishHaOnline() {
   if (!mqttHandle || !mqttOnline || mqttStopping) return -1;
   return esp_mqtt_client_enqueue(mqttHandle, haTopics.status.c_str(), "online", 6, 1, false, false);
@@ -190,7 +243,7 @@ inline bool startMqtt(const AppSettings &s) {
   if (s.uri.compare(0, 8, "mqtts://") == 0) {
     if (s.mqttCa.empty() || time(nullptr) < 1704067200) return false;
     config.broker.verification.certificate = transportSettings.mqttCa.c_str();
-    config.broker.verification.skip_cert_common_name_check=true;
+    config.broker.verification.skip_cert_common_name_check = true;
   }
   config.credentials.client_id = nodeId.c_str();
   config.credentials.username = transportSettings.user.c_str();
@@ -213,8 +266,14 @@ inline bool startMqtt(const AppSettings &s) {
     stopMqtt();
     return false;
   }
+
+  std::string bootreason = logbootreason();
+  esp_mqtt_client_enqueue(mqttHandle, haTopics.bootreason.c_str(), bootreason.c_str(), bootreason.length(), 1, false, false);
   return true;
 }
+
+
+///////////////////////
 inline int publishJson(const char *suffix, const JsonDocument &doc, int qos = 1) {
   if (!mqttHandle || !mqttOnline || doc.overflowed()) return -1;
   std::string payload;
@@ -259,11 +318,20 @@ inline void serviceHomeAssistant(const std::string &label, const char *firmware)
   const uint32_t now = millis();
   if (int32_t(now - haNextCleanup) >= 0) {
     for (auto old = haRetiredDiscovery.begin(); old != haRetiredDiscovery.end();) {
-      if (old->broker != transportSettings.uri) { ++old; continue; }
+      if (old->broker != transportSettings.uri) {
+        ++old;
+        continue;
+      }
       // A room can be renamed back before a failed cleanup was retried.
-      if (old->topic == haTopics.discovery) { old = haRetiredDiscovery.erase(old); continue; }
+      if (old->topic == haTopics.discovery) {
+        old = haRetiredDiscovery.erase(old);
+        continue;
+      }
       const int id = esp_mqtt_client_publish(mqttHandle, old->topic.c_str(), "", 0, 1, true);
-      if (!waitForAck(id, 2000)) { haNextCleanup = millis() + 5000; break; }
+      if (!waitForAck(id, 2000)) {
+        haNextCleanup = millis() + 5000;
+        break;
+      }
       old = haRetiredDiscovery.erase(old);
     }
   }

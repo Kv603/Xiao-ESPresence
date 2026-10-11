@@ -113,16 +113,24 @@ inline bool saveSettings(const AppSettings &s) {
   return ok;
 }
 inline bool loadSettings() {
-  if (settings.uri.empty()) settings.uri = std::string("mqtt://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT);
-  // Compatibility with the previous firmware's namespace and keys.
-  Preferences old;
-  if (old.begin("mmW32", true)) {
-    settings.room = old.getString("Room", settings.room.c_str()).c_str();
-    settings.label = old.getString("Where", settings.label.c_str()).c_str();
-    if (old.isKey("MQTTServer") && std::string(TRACKER_MQTT_URI).empty())
-      settings.uri = std::string("mqtt://") + old.getString("MQTTServer").c_str() + ":" + std::to_string(MQTT_PORT);
-    old.end();
+  if (settings.uri.empty()) {
+    if (MQTT_PORT != 8883) {
+      log_w("Using cleartext MQTT");
+      settings.uri = std::string("mqtt://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT);
+    } else {
+      log_i("Using encrypted MQTTS");
+      settings.uri = std::string("mqtts://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT);
+    }
   }
+  // Compatibility with the previous firmware's namespace and keys.
+  //Preferences old;
+  // if (old.begin("mmW32", true)) {
+  //   settings.room = old.getString("Room", settings.room.c_str()).c_str();
+  //   settings.label = old.getString("Where", settings.label.c_str()).c_str();
+  //  if (old.isKey("MQTTServer") && std::string(TRACKER_MQTT_URI).empty())
+  //     settings.uri = std::string("mqtt://") + old.getString("MQTTServer").c_str() + ":" + std::to_string(MQTT_PORT);
+  //   old.end();
+  // }
   Preferences prefs;
   if (!prefs.begin("tracker", false)) return false;
   if (!prefs.isKey("settings")) {

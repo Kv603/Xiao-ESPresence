@@ -5,6 +5,8 @@
 #include <esp_task_wdt.h>
 #include <mbedtls/sha256.h>
 #include "Control_Core.h"
+#include "secrets.h"
+
  
 inline bool otaRecord(const std::string &id, const char *state, const char *detail) {
   JsonDocument doc;

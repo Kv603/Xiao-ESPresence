@@ -3,6 +3,8 @@
 #include <ArduinoJson.h>
 #include <cstdint>
 #include <string>
+#include "secrets.h"
+
 
 // BLE scanner entry points used by the application and OTA flow.
 void setupBLE(bool active);
