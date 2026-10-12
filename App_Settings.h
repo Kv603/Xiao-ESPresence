@@ -7,6 +7,7 @@
 #ifndef TRACKER_NATIVE_TEST
 #include "secrets.h"
 #endif
+#include "LED_Core.h"
 
 // Enable Arduino-style password protected OTA
 #ifndef ARDUINO_OTA
@@ -44,6 +45,7 @@ struct AppSettings {
   std::string mqttCa = MQTT_CA_PEM, otaCa = OTA_CA_PEM;
   uint32_t revision = 0;
   std::vector<homeassistant::RetiredDiscovery> discoveryCleanup;
+  leds::Config led;
 };
 static AppSettings settings;
 static bool hasSavedConnectionSettings = false;
@@ -69,7 +71,7 @@ inline bool validSettings(const AppSettings &s) {
     const unsigned char c = s.uri[i];
     if (c <= 32 || c >= 127 || c == '@' || c == '/' || c == '?' || c == '#' || c == '\\') return false;
   }
-  return safeText(s.room, 63) && safeText(s.label, 63) && safeText(s.user, 128) && safeText(s.password, 256) && validCa(s.mqttCa) && validCa(s.otaCa) && (!tls || !s.mqttCa.empty());
+  return safeText(s.room, 63) && safeText(s.label, 63) && safeText(s.user, 128) && safeText(s.password, 256) && validCa(s.mqttCa) && validCa(s.otaCa) && (!tls || !s.mqttCa.empty()) && leds::validConfig(s.led);
 }
 inline void settingsJson(JsonDocument &doc, const AppSettings &s, bool secrets) {
   doc["version"] = 1;
@@ -78,6 +80,7 @@ inline void settingsJson(JsonDocument &doc, const AppSettings &s, bool secrets) 
   doc["label"] = s.label;
   doc["uri"] = s.uri;
   doc["user"] = s.user;
+  leds::configJson(doc["led"].to<JsonObject>(), s.led);
   if (secrets) {
     doc["password"] = s.password;
     doc["mqtt_ca"] = s.mqttCa;
@@ -154,6 +157,8 @@ inline bool loadSettings() {
   if (read != n || deserializeJson(doc, encoded) || doc["version"] != 1 || !doc["revision"].is<uint32_t>()) return false;
   AppSettings candidate = settings;
   if (!patchSettings(doc.as<JsonVariantConst>(), candidate)) return false;
+  candidate.led = leds::Config{};
+  if (!doc["led"].isUnbound() && !leds::patchConfig(doc["led"], candidate.led)) return false;
   if (!homeassistant::loadCleanup(doc["discovery_cleanup"], candidate.discoveryCleanup)) return false;
   candidate.revision = doc["revision"].as<uint32_t>();
   settings = std::move(candidate);

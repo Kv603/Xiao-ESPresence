@@ -56,6 +56,21 @@ const retained = async () => {
 };
 const handle = async request => {
   switch (request.op) {
+    case 'led-preload':
+      await new Promise((done, reject) => observer.publish(request.topic, request.payload, { qos: 1, retain: true }, e => e ? reject(e) : done()));
+      break;
+    case 'led-message': {
+      if (request.publish) {
+        inbound = inbound.filter(p => p.topic !== request.topic);
+        await new Promise((done, reject) => observer.publish(request.topic, request.payload, { qos: 1, retain: false }, e => e ? reject(e) : done()));
+      }
+      await waitUntil(() => inbound.some(p => p.topic === request.topic && p.payload === request.payload));
+      const packet = inbound.find(p => p.topic === request.topic && p.payload === request.payload);
+      return { ok: true, ...packet };
+    }
+    case 'unsubscribe':
+      await new Promise((done, reject) => device.unsubscribe(request.topic, e => e ? reject(e) : done()));
+      return { ok: true };
     case 'connect':
       device = await connect({ clientId: request.clientId, will: request.will });
       inbound = []; device.on('message', (topic, payload, packet) => inbound.push({ topic, payload: payload.toString(), retain: packet.retain }));

@@ -164,8 +164,10 @@ inline void processOta(JsonVariantConst command, const std::string &id) {
     return;
   }
   ProcessingOTA = true;
+  ledController.pause();
   if (!prepareForFirmwareUpdate()) {
     ProcessingOTA = false;
+    ledController.resume();
     otaRecord(id, "failed", "cannot stop BLE");
     otaReport(id, "failed", "cannot stop BLE");
     return;
@@ -184,6 +186,7 @@ inline void processOta(JsonVariantConst command, const std::string &id) {
   otaRecord(id, "failed", error);
   Serial.printf("OTA failed: %s\n", error);
   ProcessingOTA = false;
+  ledController.resume();
   resumeAfterFirmwareUpdate();
   startMqtt(settings);
 }

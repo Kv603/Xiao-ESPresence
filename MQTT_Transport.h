@@ -7,6 +7,8 @@
 #include "Control_Core.h"
 #include "Beacon_Scanner.h"
 #include "Home_Assistant.h"
+#include "LED_Controller.h"
+#include "LED_Subscriptions.h"
 #ifndef TRACKER_NATIVE_TEST
 #include "secrets.h"
 #endif
@@ -25,6 +27,9 @@ static std::atomic<unsigned> mqttSubscriptions{ 0 };
 static std::atomic<unsigned> droppedCommands{ 0 };
 static esp_mqtt_client_handle_t mqttHandle = nullptr;
 static control::Assembly incoming;
+static leds::Subscriptions ledSubscriptions;
+static bool ledFragment = false;
+static bool controlFragment = false;
 static AppSettings transportSettings;     // Own certificate memory for client's full lifetime.
 static char selectedMqttServer[40] = {};  // 39 name bytes plus the terminating NUL.
 static homeassistant::Topics haTopics;
@@ -37,6 +42,22 @@ static unsigned controlSubscriptionMask = 0;  // Owned by the MQTT event task.
 static auto &haRetiredDiscovery = settings.discoveryCleanup;
 static uint32_t haNextCleanup = 0;
 inline bool waitForAck(int id, uint32_t timeout = 5000);
+inline void configureLedSubscriptions(const leds::Config &config) {
+  leds::Config desired = config;
+  for (auto &group : desired.topics) group.erase(std::remove_if(group.begin(), group.end(), [](const std::string &filter) {
+    return filter == "homeassistant/status" || filter == controlPrefix + "/config/set" ||
+           filter == controlPrefix + "/config/get" || filter == controlPrefix + "/ota/set";
+  }), group.end());
+  // These exact subscriptions are owned by the control/HA lifecycle. In
+  // particular, removing an LED assignment must never unsubscribe them.
+  ledSubscriptions.configure(desired);
+}
+inline void serviceLedSubscriptions() {
+  if (!mqttHandle || !mqttOnline || mqttStopping) return;
+  ledSubscriptions.service(millis(),
+    [](const std::string &filter) { return esp_mqtt_client_subscribe(mqttHandle, filter.c_str(), 1); },
+    [](const std::string &filter) { return esp_mqtt_client_unsubscribe(mqttHandle, filter.c_str()); });
+}
 
 
 
@@ -146,6 +167,7 @@ static void mqttEvent(void *, esp_event_base_t, int32_t eventId, void *eventData
       mqttAnnounce = true;
       haNewConnection = true;
       haReplay = true;
+      ledSubscriptions.connection(true);
       mqttSubscriptions = 0;
       controlSubscriptionMask = 0;
       controlSubscriptionIds[0] = esp_mqtt_client_subscribe(mqttHandle, (controlPrefix + "/config/set").c_str(), 1);
@@ -161,6 +183,10 @@ static void mqttEvent(void *, esp_event_base_t, int32_t eventId, void *eventData
       mqttReselect = !mqttStopping.load();
       mqttAnnounce = false;
       incoming.reset();
+      ledController.resetAssembly();
+      ledSubscriptions.connection(false);
+      ledFragment = false;
+      controlFragment = false;
       haBirth.reset();
       Serial.printf("MQTT to '%s' disconnected\n", selectedMqttServer);
       {
@@ -172,6 +198,7 @@ static void mqttEvent(void *, esp_event_base_t, int32_t eventId, void *eventData
       break;
 
     case MQTT_EVENT_SUBSCRIBED:
+      ledSubscriptions.acknowledge(e->msg_id);
       for (unsigned i = 0; i < 3; ++i) {
         const unsigned bit = 1U << i;
         if (controlSubscriptionIds[i] >= 0 && e->msg_id == controlSubscriptionIds[i] && !(controlSubscriptionMask & bit)) {
@@ -195,12 +222,28 @@ static void mqttEvent(void *, esp_event_base_t, int32_t eventId, void *eventData
       break;
     case MQTT_EVENT_DATA:
       if (mqttStopping) break;
-      if (!e->current_data_offset) haBirth.reset();
+      if (!e->current_data_offset) {
+        haBirth.reset();
+        ledController.resetAssembly();
+        const std::string topic(e->topic && e->topic_len > 0 && e->topic_len <= int(leds::MAX_TOPIC) ? e->topic : "",
+                                e->topic && e->topic_len > 0 && e->topic_len <= int(leds::MAX_TOPIC) ? e->topic_len : 0);
+        // Reserved control/status messages never feed LED wildcard subscriptions.
+        ledFragment = topic != "homeassistant/status" && topic != controlPrefix &&
+                      topic.compare(0, controlPrefix.size()+1, controlPrefix + "/") != 0;
+        controlFragment = topic == controlPrefix + "/config/set" || topic == controlPrefix + "/config/get" || topic == controlPrefix + "/ota/set";
+        if (!controlFragment) incoming.reset();
+      }
       if (haBirth.accepts(e->topic, e->topic_len, e->current_data_offset)) {
         incoming.reset();
         if (haBirth.add(e->data, e->data_len, e->current_data_offset, e->total_data_len)) haReplay = true;
         break;
       }
+      if (ledFragment) {
+        ledController.ingest(e->topic, e->topic_len, e->data, e->data_len,
+                             e->current_data_offset, e->total_data_len, e->retain, millis());
+        break;
+      }
+      if (!controlFragment) break;
       if (incoming.add(e->topic, e->topic_len, e->data, e->data_len, e->current_data_offset, e->total_data_len, e->retain)) {
         auto *command = new (std::nothrow) Command{ incoming.topic(), incoming.body() };
         if (!command || xQueueSend(commandQueue, &command, 0) != pdTRUE) {
@@ -238,10 +281,16 @@ inline void stopMqtt() {
   haDiscoveryPending = false;
   haBirth.reset();
   incoming.reset();
+  ledFragment = false;
+  controlFragment = false;
+  ledController.resetAssembly();
+  ledSubscriptions.connection(false);
 }
 inline bool startMqtt(const AppSettings &s) {
   stopMqtt();
   transportSettings = s;
+  // Candidate connection transactions do not activate uncommitted LED state.
+  configureLedSubscriptions(settings.led);
   haTopics = homeassistant::Topics(nodeId, bleRoomTopicName(s.room, nodeId));
   haNextCleanup = millis();
   selectMqttServer(transportSettings.uri);
@@ -291,6 +340,8 @@ inline bool waitForAck(int id, uint32_t timeout) {
   const uint32_t start = millis();
   while (id >= 0 && mqttOnline && uint32_t(millis() - start) < timeout) {
     if (mqttLastAck == id) return true;
+    serviceLeds();
+    serviceLedSubscriptions();
     delay(10);
   }
   return false;

@@ -1,9 +1,9 @@
 #include <Arduino.h>
-constexpr char FIRMWARE_VERSION[] = "c6-ble1.1.5";
+constexpr char FIRMWARE_VERSION[] = "c6-ble1.2.0";
 
 // Extend this if you confirm additional supported boards
 #if !defined(CONFIG_IDF_TARGET_ESP32C6) || !defined(ARDUINO_XIAO_ESP32C6)
-#error "Select XIAO_ESP32C6 with Arduino-ESP32 3.3.8"
+#error "Select XIAO_ESP32C6 with Arduino-ESP32 3.3.12"
 #endif
 
 #include <WiFi.h>
@@ -39,6 +39,7 @@ static bool settingsReady = false;
 static std::atomic<bool> wifiConnected{ false };
 static bool retryMqttSelection = false;
 static uint32_t nextConnect = 0, lastActiveScan = 0, lastDiagnostics = 0;
+static uint32_t lastBleService = 0;
 
 
 
@@ -105,6 +106,8 @@ static void state(const std::string &id) {
   doc["free_heap"] = ESP.getFreeHeap();
   doc["minimum_free_heap"] = ESP.getMinFreeHeap();
   doc["running_slot"] = esp_ota_get_running_partition()->label;
+  ledController.state(doc["led"].as<JsonObject>());
+  doc["led"]["subscriptions_pending"] = ledSubscriptions.pending();
   if (!appendBLEConfigurationState(doc)) {
     result(id, "error", "BLE busy");
     return;
@@ -121,6 +124,8 @@ static bool waitForConnection(uint32_t timeout) {
   const uint32_t start = millis();
   while (uint32_t(millis() - start) < timeout) {
     if (mqttOnline && mqttSubscriptions >= 3) return true;
+    serviceLeds();
+    serviceLedSubscriptions();
     doBLE();
     delay(20);
   }
@@ -181,6 +186,29 @@ static void processSettings(JsonVariantConst command, const std::string &id) {
   strlcpy(Room, settings.room.c_str(), sizeof Room);
   result(id, "saved", "settings activated");
 }
+static void processLedConfiguration(JsonVariantConst command, const std::string &id) {
+  if (!command["revision"].is<uint32_t>() || command["revision"].as<uint32_t>() != settings.revision || settings.revision == UINT32_MAX) {
+    result(id, "error", "stale or missing settings revision");
+    return;
+  }
+  AppSettings candidate = settings;
+  if (!leds::patchConfig(command, candidate.led)) {
+    result(id, "error", "invalid LED brightness, group or MQTT filter");
+    return;
+  }
+  ++candidate.revision;
+  if (!saveSettings(candidate)) {
+    result(id, "error", "LED settings persistence failed; previous settings retained");
+    return;
+  }
+  settings = std::move(candidate);
+  hasSavedConnectionSettings = true;
+  ledController.activate(settings.led);
+  configureLedSubscriptions(settings.led);
+  serviceLeds();
+  serviceLedSubscriptions();
+  result(id, "saved", "LED settings activated");
+}
 static void processCommand(const Command &command) {
   JsonDocument doc;
   log_d("processCommand('%s') payload '%s'", command.topic.c_str(), command.payload.c_str());
@@ -205,6 +233,7 @@ static void processCommand(const Command &command) {
   if (command.topic != controlPrefix + "/config/set") return;
   const std::string operation = doc["operation"] | "";
   if (operation == "settings") processSettings(doc.as<JsonVariantConst>(), id);
+  else if (operation == "led") processLedConfiguration(doc.as<JsonVariantConst>(), id);
   else if (operation == "active_scan") {
     requestActiveBLEScan();
     result(id, "accepted", "five-second active scan queued");
@@ -243,6 +272,7 @@ void SetMyHostname(const char *hostname) {
       return;
     }
     arduinoOtaOwnsUpdate = true;
+    ledController.pause();
     pauseBLEForOTA();
     if (bleScannerIsRunning()) {
       arduinoOtaFailed = true;
@@ -286,6 +316,7 @@ static void serviceArduinoOta() {
     Update.abort();
     arduinoOtaFailed = arduinoOtaOwnsUpdate = false;
     ProcessingOTA = false;
+    ledController.resume();
     setupBLE(false);
     // The normal loop reconnects MQTT using the saved connection settings.
   }
@@ -312,6 +343,8 @@ void setup() {
   printPartitions();
   commandQueue = xQueueCreate(2, sizeof(Command *));
   settingsReady = commandQueue && loadSettings();
+  ledController.begin(settingsReady ? settings.led : leds::Config{});
+  configureLedSubscriptions(settingsReady ? settings.led : leds::Config{});
   if (!settingsReady) Serial.println("Settings unavailable/invalid; USB reprovisioning required (NVS preserved)");
   strlcpy(Room, settings.room.c_str(), sizeof Room);
 
@@ -417,9 +450,13 @@ void loop() {
       requestActiveBLEScan();
       lastActiveScan = millis();
     }
-    doBLE();
-    serviceHomeAssistant(settings.label, FIRMWARE_VERSION);
-    delay(1000);
+    serviceLeds();
+    serviceLedSubscriptions();
+    if (uint32_t(millis() - lastBleService) >= 1000) {
+      lastBleService = millis();
+      doBLE();
+      serviceHomeAssistant(settings.label, FIRMWARE_VERSION);
+    }
   }
   if (uint32_t(millis() - lastDiagnostics) >= 61000) {
     Serial.printf("HEALTH wifi=%d mqtt=%d heap=%lu min_heap=%lu dropped=%u\n", WiFi.status() == WL_CONNECTED,
