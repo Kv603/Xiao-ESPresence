@@ -26,7 +26,7 @@ server.listen(0, '127.0.0.1'); await once(server, 'listening');
 const url = `mqtt://127.0.0.1:${server.address().port}`;
 const packets = [];
 broker.on('publish', packet => {
-  if (packet.topic.startsWith('devices/') || packet.topic.startsWith('homeassistant/sensor/'))
+  if (packet.topic.startsWith('devices/') || packet.topic.startsWith('homeassistant/sensor/') || packet.topic.startsWith('espresense/devices/'))
     packets.push({ topic: packet.topic, payload: packet.payload.toString(), retain: packet.retain, qos: packet.qos });
 });
 const connect = async options => {
@@ -35,6 +35,9 @@ const connect = async options => {
 };
 const end = async (client, force = false) => { if (client) await new Promise(done => client.end(force, {}, done)); };
 const observer = await connect({ clientId: 'ha-test' });
+const bleReceived = [];
+observer.on('message', (topic, payload, packet) => bleReceived.push({ topic, payload: payload.toString(), qos: packet.qos, retain: packet.retain }));
+await new Promise((done, reject) => observer.subscribe('espresense/devices/#', { qos: 0 }, e => e ? reject(e) : done()));
 let device, inbound = [], discoveryBeforeBirth = 0;
 const base = 'devices/espresense_c6-broker-test/';
 const discovery = room => `homeassistant/sensor/espresense_c6-broker-test/${room}/config`;
@@ -48,7 +51,7 @@ const retained = async () => {
   const probe = await connect({ clientId: `probe-${Date.now()}` });
   const values = new Map();
   probe.on('message', (topic, payload, packet) => { if (packet.retain) values.set(topic, payload.toString()); });
-  await new Promise((done, reject) => probe.subscribe(['homeassistant/sensor/#', `${base}#`], { qos: 1 }, e => e ? reject(e) : done()));
+  await new Promise((done, reject) => probe.subscribe(['homeassistant/sensor/#', `${base}#`, 'espresense/devices/#'], { qos: 1 }, e => e ? reject(e) : done()));
   await sleep(100); await end(probe); return values;
 };
 const handle = async request => {
@@ -75,6 +78,15 @@ const handle = async request => {
       return { ok: true, ...inbound.find(p => p.topic === 'homeassistant/status' && p.payload === 'online') };
     case 'check': {
       const values = await retained();
+      if (request.name === 'ble-qos0') {
+        const topic = 'espresense/devices/iBeacon:699ebc80-e1f3-11e3-9a0f-0cf3ee3bc012-1-52753/c6_10bda39f8f98';
+        await waitUntil(() => bleReceived.some(p => p.topic === topic));
+        const packet = bleReceived.find(p => p.topic === topic);
+        assert.equal(packet.qos, 0); assert.equal(packet.retain, false);
+        assert.equal(JSON.parse(packet.payload).distance, 1.25);
+        assert(!values.has(topic), 'BLE readings must not be retained');
+        console.log('PASS ble-qos0'); break;
+      }
       if (request.name === 'pending-cleanup') {
         assert(values.has(discovery('living_room')), 'Old discovery should still exist before cleanup');
         assert(!values.has(discovery('kitchen')), 'Candidate discovery is deferred until committed settings are serviced');

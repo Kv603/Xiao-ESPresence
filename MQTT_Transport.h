@@ -120,7 +120,8 @@ struct MqttAdapter {
   }
   int publish(const char *topic, uint8_t qos, bool retain, const char *payload, size_t n) {
     if (!mqttHandle || !connected()) return 0;
-    const int result = esp_mqtt_client_enqueue(mqttHandle, topic, payload, int(n), qos, retain, false);
+    // ESP-MQTT rejects QoS 0 enqueue unless storage is explicitly requested.
+    const int result = esp_mqtt_client_enqueue(mqttHandle, topic, payload, int(n), qos, retain, qos == 0);
 
     if (-2 == result) log_w("Outbox full publishing %d bytes to topic '%s, returned %d'", int(n), topic, result);
     if (-1 == result) log_w("Failed publishing %d bytes to topic '%s, returned %d'", int(n), topic, result);
@@ -284,7 +285,7 @@ inline int publishJson(const char *suffix, const JsonDocument &doc, int qos = 1)
   if (!mqttHandle || !mqttOnline || doc.overflowed()) return -1;
   std::string payload;
   serializeJson(doc, payload);
-  return esp_mqtt_client_enqueue(mqttHandle, (controlPrefix + suffix).c_str(), payload.c_str(), int(payload.size()), qos, false, false);
+  return esp_mqtt_client_enqueue(mqttHandle, (controlPrefix + suffix).c_str(), payload.c_str(), int(payload.size()), qos, false, qos == 0);
 }
 inline bool waitForAck(int id, uint32_t timeout) {
   const uint32_t start = millis();

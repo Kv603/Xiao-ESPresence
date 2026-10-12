@@ -17,7 +17,7 @@ struct IPAddress {
 };
 struct { int hostByName(const char *, IPAddress &) { return 1; } } Network;
 static uint32_t clockMs = 0, testCount = 0;
-static bool countAvailable = true, enqueueAccept = true, publishAccept = true, ackPublish = true, startAccept = true;
+static bool countAvailable = true, enqueueAccept = true, enqueueFull = false, publishAccept = true, ackPublish = true, startAccept = true;
 static bool autoConnect = false, rejectProbe = false, disconnectOnCleanup = false;
 static std::string rejectRoomTopic, rejectBrokerUri;
 static std::vector<std::string> attemptedBrokers;
@@ -105,7 +105,7 @@ int esp_mqtt_client_subscribe(esp_mqtt_client_handle_t, const char *topic, int q
 static int send(const char *topic, const char *data, int len, int qos, bool retain, bool synchronous) {
   if (!(synchronous ? publishAccept : enqueueAccept)) return -1;
   if (rejectProbe && std::string(data, len).find("candidate_connected") != std::string::npos) return -1;
-  const int id = nextId++;
+  const int id = qos ? nextId++ : 0;
   messages.push_back({ topic, std::string(data, len ? size_t(len) : std::strlen(data)), qos, retain, synchronous, id });
 #ifdef MQTT_BROKER_TEST
   JsonDocument request; request["op"] = "publish"; request["topic"] = topic;
@@ -113,11 +113,14 @@ static int send(const char *topic, const char *data, int len, int qos, bool reta
   brokerCall(request);
 #endif
   operations.push_back(std::string(topic) + ":" + messages.back().payload);
-  pendingAck = id;
+  if (qos) pendingAck = id;
   if (disconnectOnCleanup && synchronous && retain && messages.back().payload.empty()) event(MQTT_EVENT_DISCONNECTED);
   return id;
 }
-int esp_mqtt_client_enqueue(esp_mqtt_client_handle_t, const char *topic, const char *data, int len, int qos, bool retain, bool) {
+int esp_mqtt_client_enqueue(esp_mqtt_client_handle_t, const char *topic, const char *data, int len, int qos, bool retain, bool store) {
+  // Mirror ESP-MQTT: QoS 0 requires store=true, and success returns ID zero.
+  if (qos == 0 && !store) return -1;
+  if (enqueueFull) return -2;
   return send(topic, data, len, qos, retain, false);
 }
 int esp_mqtt_client_publish(esp_mqtt_client_handle_t, const char *topic, const char *data, int len, int qos, bool retain) {
@@ -201,6 +204,24 @@ int main() {
   serviceHomeAssistant("My tracker", "test-version"); assert(countMessages(count) == beforeBusy);
   enqueueAccept = true; serviceHomeAssistant("My tracker", "test-version"); assert(countMessages(count) == beforeBusy + 1);
   for (const auto &m : messages) { assert(m.qos == 1); if (m.payload == "online") assert(!m.retain); }
+
+  const std::string bleTopic = "espresense/devices/iBeacon:699ebc80-e1f3-11e3-9a0f-0cf3ee3bc012-1-52753/c6_10bda39f8f98";
+  const std::string blePayload(173, 'x');
+  assert(esp_mqtt_client_enqueue(mqttHandle, bleTopic.c_str(), blePayload.c_str(), int(blePayload.size()), 0, false, false) == -1);
+  assert(mqttClient.publish(bleTopic.c_str(), 0, false, blePayload.c_str(), blePayload.size()) == 1);
+  assert(lastMessage(bleTopic).id == 0 && lastMessage(bleTopic).qos == 0 && !lastMessage(bleTopic).retain);
+  assert(lastMessage(bleTopic).payload == blePayload);
+  const size_t beforeQos0Failure = messages.size();
+  enqueueAccept = false;
+  assert(mqttClient.publish(bleTopic.c_str(), 0, false, blePayload.c_str(), blePayload.size()) == 0);
+  enqueueAccept = true; enqueueFull = true;
+  assert(mqttClient.publish(bleTopic.c_str(), 0, false, blePayload.c_str(), blePayload.size()) == 0);
+  enqueueFull = false; mqttOnline = false;
+  assert(mqttClient.publish(bleTopic.c_str(), 0, false, blePayload.c_str(), blePayload.size()) == 0);
+  mqttOnline = true; assert(messages.size() == beforeQos0Failure);
+  JsonDocument qos0Json; qos0Json["state"] = "qos0-test";
+  assert(publishJson("/test/qos0", qos0Json, 0) == 0);
+  assert(lastMessage(controlPrefix + "/test/qos0").qos == 0 && !lastMessage(controlPrefix + "/test/qos0").retain);
 
   // A lost connection cannot keep the application reporting online.
   incoming.add("t", 1, "a", 1, 0, 2, false);

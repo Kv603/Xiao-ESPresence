@@ -12,6 +12,10 @@ int main() {
   autoConnect = true; testCount = 2;
   assert(startMqtt(settings)); serviceHomeAssistant(settings.label, "broker-test");
   checkpoint("startup");
+  const char *bleTopic = "espresense/devices/iBeacon:699ebc80-e1f3-11e3-9a0f-0cf3ee3bc012-1-52753/c6_10bda39f8f98";
+  const std::string blePayload = "{\"id\":\"iBeacon:699ebc80-e1f3-11e3-9a0f-0cf3ee3bc012-1-52753\",\"distance\":1.25}";
+  assert(mqttClient.publish(bleTopic, 0, false, blePayload.c_str(), blePayload.size()) == 1);
+  checkpoint("ble-qos0");
   JsonDocument drop; drop["op"] = "drop"; brokerCall(drop);
   event(MQTT_EVENT_DISCONNECTED); checkpoint("lwt");
   assert(startMqtt(settings)); serviceHomeAssistant(settings.label, "broker-test");
