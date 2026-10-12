@@ -15,10 +15,10 @@ function Extract-Function([string]$source,[string]$signature) {
 }
 $roomSource='namespace bletrack {' + (Extract-Function $bleSource 'std::string normalize(const std::string &s, char separator) {') + "`n}`n" + (Extract-Function $bleSource 'std::string bleRoomTopicName(const std::string &room, const std::string &node) {')
 Set-Content (Join-Path $out 'mqtt-room-test.inc') $roomSource
-$settingsSource=(Extract-Function $sketchSource 'static bool networkChanged(const AppSettings &a, const AppSettings &b) {') + "`n" + (Extract-Function $sketchSource 'static void processSettings(JsonVariantConst command, const std::string &id) {')
+$settingsSource=(Extract-Function $sketchSource 'static bool mqttConnectionChanged(const AppSettings &a, const AppSettings &b) {') + "`n" + (Extract-Function $sketchSource 'static bool networkChanged(const AppSettings &a, const AppSettings &b) {') + "`n" + (Extract-Function $sketchSource 'static void processSettings(JsonVariantConst command, const std::string &id) {')
 Set-Content (Join-Path $out 'settings-test.inc') $settingsSource
 foreach($test in @('core','rssi-equivalence','runtime','control','mqtt')) {
-  & $Compiler -std=c++17 -O1 -Wall -Wextra -Werror "-I$PSScriptRoot/stubs" "-I$json" (Join-Path $PSScriptRoot "test-$test.cpp") -o (Join-Path $out "$test.exe")
+  & $Compiler -std=c++17 -O1 -Wall -Wextra -Werror -include "$PSScriptRoot/stubs/Test_Config.h" "-I$PSScriptRoot/stubs" "-I$json" (Join-Path $PSScriptRoot "test-$test.cpp") -o (Join-Path $out "$test.exe")
   if($LASTEXITCODE){throw "$test compilation failed"}
   & (Join-Path $out "$test.exe")
   if($LASTEXITCODE){throw "$test failed"}

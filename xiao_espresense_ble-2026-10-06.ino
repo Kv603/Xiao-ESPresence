@@ -79,8 +79,11 @@ static AppSettings mqttSettingsForWifi(bool retrySelection) {
 
 
 
+static bool mqttConnectionChanged(const AppSettings &a, const AppSettings &b) {
+  return a.uri != b.uri || a.user != b.user || a.password != b.password || a.mqttCa != b.mqttCa;
+}
 static bool networkChanged(const AppSettings &a, const AppSettings &b) {
-  return a.uri != b.uri || a.user != b.user || a.password != b.password || a.mqttCa != b.mqttCa || bleRoomTopicName(a.room, nodeId) != bleRoomTopicName(b.room, nodeId);
+  return mqttConnectionChanged(a, b) || bleRoomTopicName(a.room, nodeId) != bleRoomTopicName(b.room, nodeId);
 }
 static void result(const std::string &id, const char *status, const char *detail) {
   JsonDocument doc;
@@ -135,6 +138,10 @@ static void processSettings(JsonVariantConst command, const std::string &id) {
   }
   ++candidate.revision;
   const bool reconnect = networkChanged(settings, candidate);
+  const AppSettings previousTransport = mqttHandle ? transportSettings : settings;
+  AppSettings candidateTransport = candidate;
+  // A new room needs a new LWT, while the healthy selected broker stays active.
+  if (!mqttConnectionChanged(settings, candidate)) candidateTransport.uri = previousTransport.uri;
   if (reconnect) {
     JsonDocument accepted;
     accepted["id"] = id;
@@ -143,8 +150,8 @@ static void processSettings(JsonVariantConst command, const std::string &id) {
       result(id, "error", "acknowledgement timeout");
       return;
     }
-    if (!startMqtt(candidate) || !waitForConnection(30000)) {
-      startMqtt(settings);
+    if (!startMqtt(candidateTransport) || !waitForConnection(30000)) {
+      startMqtt(previousTransport);
       waitForConnection(15000);
       result(id, "error", "candidate broker failed; previous settings restored");
       return;
@@ -153,22 +160,23 @@ static void processSettings(JsonVariantConst command, const std::string &id) {
     probe["id"] = id;
     probe["status"] = "candidate_connected";
     if (!waitForAck(publishJson("/config/result", probe))) {
-      startMqtt(settings);
+      startMqtt(previousTransport);
       waitForConnection(15000);
       result(id, "error", "candidate publish failed; previous settings restored");
       return;
     }
   }
-  if (!saveSettings(candidate)) {
+  if (!retireHaDiscovery(settings, candidate) || !saveSettings(candidate)) {
     if (reconnect) {
-      startMqtt(settings);
+      startMqtt(previousTransport);
       waitForConnection(15000);
     }
-    result(id, "error", "NVS write failed; previous settings retained");
+    result(id, "error", "settings/cleanup persistence failed; previous settings retained");
     return;
   }
-  retireHaDiscovery(settings, candidate);
   settings = std::move(candidate);
+  haNextCleanup = millis();
+  haReplay = true;  // Also refresh discovery after a label-only change.
   hasSavedConnectionSettings = true;
   strlcpy(Room, settings.room.c_str(), sizeof Room);
   result(id, "saved", "settings activated");

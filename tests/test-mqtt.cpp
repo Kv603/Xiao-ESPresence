@@ -9,10 +9,7 @@
 #include <vector>
 #include "stubs/mqtt_client.h"
 
-struct AppSettings {
-  std::string uri = "mqtt://test:1883", user, password, mqttCa, room = "Living Room", label = "Tracker";
-  uint32_t revision = 0;
-};
+#include "../App_Settings.h"
 struct { void printf(const char *, ...) {} void println(const char *) {} } Serial;
 struct IPAddress {
   struct Text { const char *c_str() const { return "127.0.0.1"; } };
@@ -21,8 +18,9 @@ struct IPAddress {
 struct { int hostByName(const char *, IPAddress &) { return 1; } } Network;
 static uint32_t clockMs = 0, testCount = 0;
 static bool countAvailable = true, enqueueAccept = true, publishAccept = true, ackPublish = true, startAccept = true;
-static bool autoConnect = false, saveSucceeds = true, rejectProbe = false;
-static std::string rejectRoomTopic;
+static bool autoConnect = false, rejectProbe = false, disconnectOnCleanup = false;
+static std::string rejectRoomTopic, rejectBrokerUri;
+static std::vector<std::string> attemptedBrokers;
 uint32_t millis() { return clockMs; }
 void delay(unsigned ms);
 #include "../build/native-c6/mqtt-room-test.inc"
@@ -75,7 +73,8 @@ int esp_mqtt_client_register_event(esp_mqtt_client_handle_t c, int, MqttEventHan
   c->handler = handler; return ESP_OK;
 }
 int esp_mqtt_client_start(esp_mqtt_client_handle_t c) {
-  if (!startAccept || c->willTopic == rejectRoomTopic) return -1;
+  attemptedBrokers.emplace_back(c->config.broker.address.uri);
+  if (!startAccept || c->willTopic == rejectRoomTopic || attemptedBrokers.back() == rejectBrokerUri) return -1;
 #ifdef MQTT_BROKER_TEST
   JsonDocument request; request["op"] = "connect"; request["clientId"] = nodeId;
   request["will"]["topic"] = c->willTopic; request["will"]["payload"] = c->willPayload;
@@ -115,6 +114,7 @@ static int send(const char *topic, const char *data, int len, int qos, bool reta
 #endif
   operations.push_back(std::string(topic) + ":" + messages.back().payload);
   pendingAck = id;
+  if (disconnectOnCleanup && synchronous && retain && messages.back().payload.empty()) event(MQTT_EVENT_DISCONNECTED);
   return id;
 }
 int esp_mqtt_client_enqueue(esp_mqtt_client_handle_t, const char *topic, const char *data, int len, int qos, bool retain, bool) {
@@ -138,15 +138,8 @@ static void data(const char *topic, const char *payload, bool retained, int offs
   mqttEvent(nullptr, nullptr, MQTT_EVENT_DATA, &e);
 }
 
-static AppSettings settings;
-static bool hasSavedConnectionSettings = false;
 static char Room[64] = {};
 static std::string resultStatus, resultDetail;
-bool patchSettings(JsonVariantConst command, AppSettings &s) {
-  if (command["room"].is<const char *>()) s.room = command["room"].as<std::string>();
-  return true;
-}
-bool saveSettings(const AppSettings &) { return saveSucceeds; }
 bool waitForConnection(uint32_t) { return mqttOnline && mqttSubscriptions >= 3; }
 void result(const std::string &, const char *status, const char *detail) { resultStatus = status; resultDetail = detail; }
 size_t strlcpy(char *out, const char *value, size_t size) {
@@ -165,10 +158,10 @@ int main() {
   const std::string count = "devices/espresense_c6-test/living_room/count";
   assert(mqttHandle->willTopic == status && mqttHandle->willPayload == "offline");
   assert(mqttHandle->config.session.last_will.qos == 1 && mqttHandle->config.session.last_will.retain);
-  assert(messages.empty()); // Discovery is deferred until the connection succeeds.
+  assert(countMessages(discovery) == 0); // Discovery is deferred until the connection succeeds.
   event(MQTT_EVENT_CONNECTED);
-  assert(messages.size() == 2 && messages[0].topic == status && messages[0].payload.empty() && messages[0].retain);
-  assert(messages[1].payload == "online" && !messages[1].retain);
+  assert(lastMessage(status).payload == "online" && !lastMessage(status).retain);
+  assert(messages[messages.size() - 2].topic == status && messages[messages.size() - 2].payload.empty() && messages[messages.size() - 2].retain);
   assert(subscriptions.size() == 4);
   event(MQTT_EVENT_SUBSCRIBED, subscriptions[3].second); assert(mqttSubscriptions == 0);
   event(MQTT_EVENT_SUBSCRIBED, subscriptions[1].second);
@@ -237,7 +230,9 @@ int main() {
   assert(haTopics.discovery == discovery);
   assert(startMqtt(candidate)); event(MQTT_EVENT_CONNECTED);
   assert(mqttHandle->willTopic == "devices/espresense_c6-test/kitchen/status");
-  retireHaDiscovery(settings, candidate); serviceHomeAssistant(candidate.label, "test-version");
+  assert(retireHaDiscovery(settings, candidate));
+  assert(saveSettings(candidate)); ::settings = candidate; haReplay = true;
+  serviceHomeAssistant(candidate.label, "test-version");
   assert(lastMessage(discovery).payload.empty() && lastMessage(discovery).retain && haRetiredDiscovery.empty());
   assert(!deserializeJson(config, lastMessage(haTopics.discovery).payload));
   assert(config["unique_id"] == "espresense_c6-test_device_count");
@@ -251,11 +246,11 @@ int main() {
   assert(startMqtt(::settings)); serviceHomeAssistant(::settings.label, "test-version");
   JsonDocument command; command["revision"] = 0; command["room"] = "Kitchen";
   const size_t kitchenBefore = countMessages("homeassistant/sensor/espresense_c6-test/kitchen/config");
-  saveSucceeds = false;
+  Preferences::failWrite = true;
   processSettings(command.as<JsonVariantConst>(), "save-fail");
   assert(resultStatus == "error" && ::settings.room == "Living Room" && haTopics.discovery == discovery);
   assert(haRetiredDiscovery.empty() && countMessages("homeassistant/sensor/espresense_c6-test/kitchen/config") == kitchenBefore);
-  saveSucceeds = true; rejectRoomTopic = "devices/espresense_c6-test/kitchen/status";
+  Preferences::failWrite = false; rejectRoomTopic = "devices/espresense_c6-test/kitchen/status";
   processSettings(command.as<JsonVariantConst>(), "connect-fail");
   assert(resultStatus == "error" && haTopics.discovery == discovery && haRetiredDiscovery.empty());
   rejectRoomTopic.clear(); rejectProbe = true;
@@ -271,9 +266,103 @@ int main() {
   AppSettings equivalent = ::settings; equivalent.room = "KITCHEN";
   assert(!networkChanged(::settings, equivalent));
   stopMqtt();
+
+  // Commit a new room, lose connectivity before its tombstone is acknowledged,
+  // then boot from the real settings blob. No RAM journal survives this reset.
+  ::settings = AppSettings(); assert(saveSettings(::settings));
+  assert(startMqtt(::settings));
+  command["revision"] = 0; command["room"] = "Kitchen";
+  processSettings(command.as<JsonVariantConst>(), "durable-room");
+  assert(resultStatus == "saved" && haRetiredDiscovery.size() == 1);
+  disconnectOnCleanup = true;
+  serviceHomeAssistant(::settings.label, "test-version");
+  assert(!mqttOnline && haRetiredDiscovery.size() == 1);
+  disconnectOnCleanup = false; stopMqtt();
+  ::settings = AppSettings(); hasSavedConnectionSettings = false;
+  assert(haRetiredDiscovery.empty() && loadSettings());
+  assert(::settings.room == "Kitchen" && haRetiredDiscovery.size() == 1);
+  assert(haRetiredDiscovery[0].topic == discovery);
+  assert(startMqtt(::settings));
+  // Even after PUBACK, failure to save the journal removal leaves it retryable.
+  Preferences::failWrite = true;
+  serviceHomeAssistant(::settings.label, "test-version");
+  assert(haRetiredDiscovery.size() == 1);
+  Preferences::failWrite = false; stopMqtt();
+  ::settings = AppSettings(); assert(loadSettings() && haRetiredDiscovery.size() == 1);
+  assert(startMqtt(::settings)); serviceHomeAssistant(::settings.label, "test-version");
+  assert(haRetiredDiscovery.empty() && lastMessage(discovery).payload.empty());
+  stopMqtt(); ::settings = AppSettings(); assert(loadSettings() && haRetiredDiscovery.empty());
+
+  // Renaming back before cleanup must never tombstone the active discovery.
+  ::settings = AppSettings(); assert(saveSettings(::settings)); assert(startMqtt(::settings));
+  command["revision"] = 0; command["room"] = "Kitchen";
+  processSettings(command.as<JsonVariantConst>(), "rename-out");
+  command["revision"] = 1; command["room"] = "Living Room";
+  processSettings(command.as<JsonVariantConst>(), "rename-back");
+  assert(resultStatus == "saved" && haRetiredDiscovery.size() == 2);
+  const size_t beforeRenameCleanup = countMessages(discovery);
+  serviceHomeAssistant(::settings.label, "test-version");
+  assert(haRetiredDiscovery.empty() && countMessages(discovery) == beforeRenameCleanup + 1);
+  assert(!lastMessage(discovery).payload.empty()); stopMqtt();
+
+  // Room-only edits and every failed-candidate rollback stay on the healthy
+  // backup, while NVS continues to hold the user's configured primary URI.
+  ::settings = AppSettings(); ::settings.uri = "mqtt://primary:1883";
+  assert(saveSettings(::settings));
+  AppSettings backup = ::settings; backup.uri = "mqtt://backup:1883";
+  rejectBrokerUri = ::settings.uri; assert(startMqtt(backup)); attemptedBrokers.clear();
+  command["revision"] = 0; command["room"] = "Kitchen";
+  processSettings(command.as<JsonVariantConst>(), "backup-room");
+  assert(resultStatus == "saved" && ::settings.uri == "mqtt://primary:1883");
+  assert(transportSettings.uri == backup.uri && mqttHandle->willTopic == "devices/espresense_c6-test/kitchen/status");
+  assert(attemptedBrokers.size() == 1 && attemptedBrokers[0] == backup.uri);
+  assert(haRetiredDiscovery.size() == 1 && haRetiredDiscovery[0].broker == backup.uri);
+  serviceHomeAssistant(::settings.label, "test-version");
+  command["revision"] = 1; command["room"] = "Office";
+  for (unsigned failure = 0; failure < 3; ++failure) {
+    Preferences::failWrite = failure == 0;
+    rejectProbe = failure == 1;
+    rejectRoomTopic = failure == 2 ? "devices/espresense_c6-test/office/status" : "";
+    attemptedBrokers.clear(); processSettings(command.as<JsonVariantConst>(), "backup-failure");
+    assert(resultStatus == "error" && ::settings.room == "Kitchen" && transportSettings.uri == backup.uri);
+    assert(mqttHandle->willTopic == "devices/espresense_c6-test/kitchen/status");
+    for (const auto &broker : attemptedBrokers) assert(broker == backup.uri);
+  }
+  Preferences::failWrite = false; rejectProbe = false; rejectRoomTopic.clear();
+  command["uri"] = "mqtt://primary:1883"; command["user"] = "new-user";
+  processSettings(command.as<JsonVariantConst>(), "explicit-broker-failure");
+  assert(resultStatus == "error" && transportSettings.uri == backup.uri);
+  stopMqtt(); ::settings = AppSettings(); assert(loadSettings());
+  assert(::settings.uri == "mqtt://primary:1883" && ::settings.room == "Kitchen");
+  rejectBrokerUri.clear();
+
+  // Cleanup remains durable while using another broker, and resumes when the
+  // broker tagged in its record is selected again after reboot.
+  ::settings = AppSettings(); ::settings.room = "Kitchen";
+  ::settings.discoveryCleanup.push_back({ backup.uri, discovery }); assert(saveSettings(::settings));
+  ::settings = AppSettings(); assert(loadSettings()); assert(startMqtt(::settings));
+  const size_t beforeOtherBroker = countMessages(discovery);
+  serviceHomeAssistant(::settings.label, "test-version");
+  assert(haRetiredDiscovery.size() == 1 && countMessages(discovery) == beforeOtherBroker);
+  backup = ::settings; backup.uri = "mqtt://backup:1883"; assert(startMqtt(backup));
+  serviceHomeAssistant(::settings.label, "test-version"); assert(haRetiredDiscovery.empty()); stopMqtt();
+
+  // Old blobs without a journal stay compatible; corrupt journal records fail
+  // loading without replacing active settings or erasing their stored bytes.
+  JsonDocument stored; settingsJson(stored, ::settings, true); stored.remove("discovery_cleanup");
+  std::string encoded; serializeJson(stored, encoded);
+  Preferences::saved.assign(encoded.begin(), encoded.end()); assert(loadSettings() && haRetiredDiscovery.empty());
+  stored["discovery_cleanup"][0]["broker"] = "mqtt://backup:1883";
+  stored["discovery_cleanup"][0]["topic"] = "homeassistant/sensor/+/config";
+  encoded.clear(); serializeJson(stored, encoded); Preferences::saved.assign(encoded.begin(), encoded.end());
+  assert(!loadSettings() && haRetiredDiscovery.empty());
+  AppSettings full = ::settings;
+  for (size_t i = 0; i < homeassistant::MAX_RETIRED_DISCOVERY; ++i)
+    full.discoveryCleanup.push_back({ "mqtt://test:1883", homeassistant::Topics(nodeId, "room" + std::to_string(i)).discovery });
+  full.room = "Office"; assert(!retireHaDiscovery(::settings, full));
   homeassistant::Reporting rollover;
   rollover.published(1, UINT32_MAX - 500);
   assert(!rollover.due(2, 498) && rollover.due(2, 499));
-  std::cout << "MQTT discovery/count/availability tests passed: QoS, retain, LWT, birth, subscriptions, cadence, shutdown and rollback.\n";
+  std::cout << "MQTT tests passed: discovery, count, availability, durable cleanup, reboot recovery, backup broker and rollback.\n";
 }
 #endif

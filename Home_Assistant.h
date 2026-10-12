@@ -3,7 +3,9 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#ifndef TRACKER_NATIVE_TEST
 #include "secrets.h"
+#endif
 
 namespace homeassistant {
 struct Topics {

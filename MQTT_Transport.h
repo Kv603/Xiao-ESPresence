@@ -1,12 +1,15 @@
 #pragma once
 #include <mqtt_client.h>
+#include <esp_system.h>
 #include <atomic>
 #include <freertos/queue.h>
 #include <vector>
 #include "Control_Core.h"
 #include "Beacon_Scanner.h"
 #include "Home_Assistant.h"
+#ifndef TRACKER_NATIVE_TEST
 #include "secrets.h"
+#endif
 
 struct Command {
   std::string topic, payload;
@@ -30,10 +33,8 @@ static homeassistant::Birth haBirth;
 static bool haDiscoveryPending = false;
 static int controlSubscriptionIds[3] = { -1, -1, -1 };
 static unsigned controlSubscriptionMask = 0;  // Owned by the MQTT event task.
-struct RetiredDiscovery {
-  std::string broker, topic;
-};
-static std::vector<RetiredDiscovery> haRetiredDiscovery;
+// The settings blob is the authoritative journal, restored by loadSettings().
+static auto &haRetiredDiscovery = settings.discoveryCleanup;
 static uint32_t haNextCleanup = 0;
 inline bool waitForAck(int id, uint32_t timeout = 5000);
 
@@ -120,6 +121,10 @@ struct MqttAdapter {
   int publish(const char *topic, uint8_t qos, bool retain, const char *payload, size_t n) {
     if (!mqttHandle || !connected()) return 0;
     const int result = esp_mqtt_client_enqueue(mqttHandle, topic, payload, int(n), qos, retain, false);
+
+    if (-2 == result) log_w("Outbox full publishing %d bytes to topic '%s, returned %d'", int(n), topic, result);
+    if (-1 == result) log_w("Failed publishing %d bytes to topic '%s, returned %d'", int(n), topic, result);
+
     return result >= 0 ? result + 1 : 0;  // ESP-MQTT uses zero for successful QoS 0.
   }
 } mqttClient;
@@ -237,6 +242,7 @@ inline bool startMqtt(const AppSettings &s) {
   stopMqtt();
   transportSettings = s;
   haTopics = homeassistant::Topics(nodeId, bleRoomTopicName(s.room, nodeId));
+  haNextCleanup = millis();
   selectMqttServer(transportSettings.uri);
   esp_mqtt_client_config_t config{};
   config.broker.address.uri = transportSettings.uri.c_str();
@@ -289,19 +295,21 @@ inline bool waitForAck(int id, uint32_t timeout) {
   return false;
 }
 
-// Call only after the settings transaction has committed, never while testing
-// a candidate room/broker. All discovery JSON and BLE reads run in loop().
-inline void retireHaDiscovery(const AppSettings &previous, const AppSettings &current) {
+// Stage the tombstone in the candidate before saving. The room and its cleanup
+// journal must commit in a single NVS write, including across sudden resets.
+inline bool retireHaDiscovery(const AppSettings &previous, AppSettings &current) {
   const homeassistant::Topics oldTopics(nodeId, bleRoomTopicName(previous.room, nodeId));
   const homeassistant::Topics newTopics(nodeId, bleRoomTopicName(current.room, nodeId));
   if (oldTopics.discovery != newTopics.discovery) {
     bool found = false;
-    for (const auto &old : haRetiredDiscovery)
+    for (const auto &old : current.discoveryCleanup)
       if (old.broker == transportSettings.uri && old.topic == oldTopics.discovery) found = true;
-    if (!found) haRetiredDiscovery.push_back({ transportSettings.uri, oldTopics.discovery });
-    haNextCleanup = millis();
+    if (!found) {
+      if (current.discoveryCleanup.size() >= homeassistant::MAX_RETIRED_DISCOVERY) return false;
+      current.discoveryCleanup.push_back({ transportSettings.uri, oldTopics.discovery });
+    }
   }
-  haReplay = true;  // Also refresh discovery after a label-only change.
+  return true;
 }
 
 inline void serviceHomeAssistant(const std::string &label, const char *firmware) {
@@ -317,22 +325,28 @@ inline void serviceHomeAssistant(const std::string &label, const char *firmware)
   }
   const uint32_t now = millis();
   if (int32_t(now - haNextCleanup) >= 0) {
-    for (auto old = haRetiredDiscovery.begin(); old != haRetiredDiscovery.end();) {
-      if (old->broker != transportSettings.uri) {
-        ++old;
+    for (size_t index = 0; index < haRetiredDiscovery.size();) {
+      const auto &old = haRetiredDiscovery[index];
+      if (old.broker != transportSettings.uri) {
+        ++index;
         continue;
       }
       // A room can be renamed back before a failed cleanup was retried.
-      if (old->topic == haTopics.discovery) {
-        old = haRetiredDiscovery.erase(old);
-        continue;
+      if (old.topic != haTopics.discovery) {
+        const int id = esp_mqtt_client_publish(mqttHandle, old.topic.c_str(), "", 0, 1, true);
+        if (!waitForAck(id, 2000)) {
+          haNextCleanup = millis() + 5000;
+          break;
+        }
       }
-      const int id = esp_mqtt_client_publish(mqttHandle, old->topic.c_str(), "", 0, 1, true);
-      if (!waitForAck(id, 2000)) {
+      AppSettings cleaned = settings;
+      cleaned.discoveryCleanup.erase(cleaned.discoveryCleanup.begin() + index);
+      if (!saveSettings(cleaned)) {
+        // Keep the durable record on failure; repeating a tombstone is safe.
         haNextCleanup = millis() + 5000;
         break;
       }
-      old = haRetiredDiscovery.erase(old);
+      haRetiredDiscovery.swap(cleaned.discoveryCleanup);
     }
   }
   if (!mqttOnline || mqttStopping) return;

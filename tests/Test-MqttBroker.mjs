@@ -12,6 +12,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const compiler = process.env.CXX || 'C:/Apps/Perl/Strawberry/c/bin/g++.exe';
 const executable = resolve(root, 'build/native-c6/mqtt-broker.exe');
 const build = spawn(compiler, ['-std=c++17', '-O1', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
+  '-include', 'tests/stubs/Test_Config.h',
   '-Itests/stubs', `-I${resolve(process.env.USERPROFILE, 'Documents/Arduino/libraries/ArduinoJson/src')}`,
   'tests/test-mqtt-broker.cpp', '-o', executable], { cwd: root, stdio: 'inherit', windowsHide: true });
 assert.equal((await once(build, 'exit'))[0], 0, 'Broker adapter compilation failed; run tests/Run.ps1 first.');
@@ -61,10 +62,12 @@ const handle = async request => {
     case 'publish':
       await new Promise((done, reject) => device.publish(request.topic, request.payload, { qos: request.qos, retain: request.retain }, e => e ? reject(e) : done())); break;
     case 'stop': await end(device, !device?.connected); device = undefined; break;
-    case 'drop':
+    case 'drop': {
+      const beforeDrop = packets.length;
       device.stream.destroy();
-      await waitUntil(() => packets.some(p => p.topic === status('living_room') && p.payload === 'offline'));
+      await waitUntil(() => packets.slice(beforeDrop).some(p => p.topic === status(request.room || 'living_room') && p.payload === 'offline'));
       break;
+    }
     case 'birth':
       discoveryBeforeBirth = packets.filter(p => p.topic === discovery('living_room') && p.payload).length;
       await new Promise((done, reject) => observer.publish('homeassistant/status', 'online', { qos: 1, retain: true }, e => e ? reject(e) : done()));
@@ -72,6 +75,11 @@ const handle = async request => {
       return { ok: true, ...inbound.find(p => p.topic === 'homeassistant/status' && p.payload === 'online') };
     case 'check': {
       const values = await retained();
+      if (request.name === 'pending-cleanup') {
+        assert(values.has(discovery('living_room')), 'Old discovery should still exist before cleanup');
+        assert(!values.has(discovery('kitchen')), 'Candidate discovery is deferred until committed settings are serviced');
+        console.log('PASS pending-cleanup'); break;
+      }
       const room = request.name === 'room-change' || request.name === 'manual-offline' ? 'kitchen' : 'living_room';
       const config = JSON.parse(values.get(discovery(room)));
       assert.equal(config.unique_id, 'espresense_c6-broker-test_device_count');

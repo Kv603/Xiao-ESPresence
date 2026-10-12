@@ -24,7 +24,14 @@ int main() {
   checkpoint("ha-restart");
   JsonDocument command; command["revision"] = 0; command["room"] = "Kitchen";
   processSettings(command.as<JsonVariantConst>(), "room-change");
-  assert(resultStatus == "saved"); serviceHomeAssistant(settings.label, "broker-test");
+  assert(resultStatus == "saved" && haRetiredDiscovery.size() == 1);
+  checkpoint("pending-cleanup");
+  drop["room"] = "kitchen"; brokerCall(drop); event(MQTT_EVENT_DISCONNECTED); stopMqtt();
+  settings = AppSettings(); hasSavedConnectionSettings = false;
+  assert(haRetiredDiscovery.empty() && loadSettings() && haRetiredDiscovery.size() == 1);
+  assert(settings.room == "Kitchen");
+  assert(startMqtt(settings)); serviceHomeAssistant(settings.label, "broker-test");
+  assert(haRetiredDiscovery.empty());
   checkpoint("room-change");
   stopMqtt(); checkpoint("manual-offline");
   std::cout << "Broker-backed MQTT acceptance passed.\n";

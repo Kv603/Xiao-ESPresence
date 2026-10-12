@@ -11,7 +11,9 @@
 #include <cstring>
 #include <new>
 #include <string>
+#ifndef TRACKER_NATIVE_TEST
 #include "secrets.h"
+#endif
 
 
 namespace bletrack {
@@ -1100,14 +1102,11 @@ bool publish(const Snapshot &v) {
   log_d("Publishing '%s'", payload);
   int retcode = mqttClient.publish(topic, 0, false, payload, used);
  
-  if (retcode > -1) {
-    // -1 or -2 are failures!
-    log_d("Published BLE payload to '%s'", topic);
+  if (retcode > 0) {
+    log_d("Published %d byte BLE payload to '%s'", used, topic);
     LastPublishTimeBLE = TimeNow;
     return (true);
   }
-  if (-2 == retcode) log_w("Outbox full publishing %d bytes to topic '%s, returned %d'", (int)used, topic, retcode);
-  else log_w("Failed to publish %d bytes to topic '%s, returned %d'", (int)used, topic, retcode);
   return (false);
 }
 

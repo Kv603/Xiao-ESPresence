@@ -3,7 +3,10 @@
 #include <Preferences.h>
 #include <mbedtls/x509_crt.h>
 #include <string>
+#include "Discovery_Cleanup.h"
+#ifndef TRACKER_NATIVE_TEST
 #include "secrets.h"
+#endif
 
 // Enable Arduino-style password protected OTA
 #ifndef ARDUINO_OTA
@@ -40,6 +43,7 @@ struct AppSettings {
   std::string uri = TRACKER_MQTT_URI, user = MQTT_USER, password = MQTT_PASS;
   std::string mqttCa = MQTT_CA_PEM, otaCa = OTA_CA_PEM;
   uint32_t revision = 0;
+  std::vector<homeassistant::RetiredDiscovery> discoveryCleanup;
 };
 static AppSettings settings;
 static bool hasSavedConnectionSettings = false;
@@ -78,6 +82,7 @@ inline void settingsJson(JsonDocument &doc, const AppSettings &s, bool secrets) 
     doc["password"] = s.password;
     doc["mqtt_ca"] = s.mqttCa;
     doc["ota_ca"] = s.otaCa;
+    homeassistant::cleanupJson(doc, s.discoveryCleanup);
   } else {
     doc["password_set"] = !s.password.empty();
     doc["mqtt_ca_set"] = !s.mqttCa.empty();
@@ -149,6 +154,7 @@ inline bool loadSettings() {
   if (read != n || deserializeJson(doc, encoded) || doc["version"] != 1 || !doc["revision"].is<uint32_t>()) return false;
   AppSettings candidate = settings;
   if (!patchSettings(doc.as<JsonVariantConst>(), candidate)) return false;
+  if (!homeassistant::loadCleanup(doc["discovery_cleanup"], candidate.discoveryCleanup)) return false;
   candidate.revision = doc["revision"].as<uint32_t>();
   settings = std::move(candidate);
   hasSavedConnectionSettings = true;

@@ -3,7 +3,9 @@
 #include <ArduinoJson.h>
 #include <cstdint>
 #include <string>
+#ifndef TRACKER_NATIVE_TEST
 #include "secrets.h"
+#endif
 
 
 // BLE scanner entry points used by the application and OTA flow.
