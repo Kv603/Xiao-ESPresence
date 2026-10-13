@@ -37,6 +37,44 @@ int main() {
   assert(startMqtt(settings)); serviceHomeAssistant(settings.label, "broker-test");
   assert(haRetiredDiscovery.empty());
   checkpoint("room-change");
+  // Real broker wildcard delivery, including the parent topic and retained rejection.
+  ledController.begin(settings.led);
+  JsonDocument retained; retained["op"] = "led-preload"; retained["topic"] = "sensor/lobby/blue";
+  retained["payload"] = "100"; brokerCall(retained);
+  JsonDocument led;
+  assert(!deserializeJson(led,R"({"brightness":128,"groups":[{"group":1,"topics":["sensor/lobby/#","sensor/+/red","motion/woodshopdoor/#"]},{"group":2,"topics":["sensor/lobby/#","motion/woodshopdoor/#"]}]})"));
+  led["revision"] = settings.revision;
+  processLedConfiguration(led.as<JsonVariantConst>(),"led-broker"); assert(resultStatus == "saved");
+  auto deliver = [](const char *topic, const char *value, bool publish = true) {
+    JsonDocument request; request["op"] = "led-message"; request["topic"] = topic;
+    request["payload"] = value; request["publish"] = publish;
+    auto reply = brokerCall(request);
+    const std::string actualTopic = reply["topic"].as<std::string>(), actualPayload = reply["payload"].as<std::string>();
+    data(actualTopic.c_str(),actualPayload.c_str(),reply["retain"].as<bool>());
+    ledController.service(clockMs,true);
+  };
+  deliver("sensor/lobby/blue","100",false); assert(ledController.lastFrame()[1] == leds::RGB{});
+  deliver("sensor/lobby/green","100"); deliver("sensor/lobby/red","100");
+  assert((ledController.lastFrame()[1] == leds::RGB{255,255,0} && ledController.lastFrame()[5] == leds::RGB{255,255,0}));
+  deliver("sensor/lobby","0"); assert(ledController.lastFrame()[1] == leds::RGB{});
+  deliver("sensor/lobby/mmwave","100"); assert((ledController.lastFrame()[1] == leds::RGB{255,255,255}));
+  clockMs += 60000; ledController.service(clockMs,true); assert(ledController.lastFrame()[1] == leds::RGB{});
+  deliver("motion/woodshopdoor","25");
+  assert((ledController.lastFrame()[1] == leds::RGB{64,64,64}));
+  deliver("motion/woodshopdoor/human","25");
+  assert((ledController.lastFrame()[1] == leds::RGB{128,128,128} && ledController.lastFrame()[5] == leds::RGB{128,128,128}));
+  deliver("motion/woodshopdoor/blue","100");
+  assert((ledController.lastFrame()[1] == leds::RGB{128,128,255}));
+  deliver("motion/woodshopdoor/human","0");
+  assert((ledController.lastFrame()[1] == leds::RGB{64,64,64}));
+  deliver("motion/woodshopdoor","0"); assert(ledController.lastFrame()[1] == leds::RGB{});
+  deliver("motion/woodshopdoor/human","lime"); assert((ledController.lastFrame()[1] == leds::RGB{0,191,0}));
+  clockMs += 60000; ledController.service(clockMs,true); assert(ledController.lastFrame()[1] == leds::RGB{});
+  JsonDocument clear; clear["revision"] = settings.revision;
+  clear["groups"][0]["group"] = 1; clear["groups"][0]["topics"].to<JsonArray>();
+  clear["groups"][1]["group"] = 2; clear["groups"][1]["topics"].to<JsonArray>();
+  processLedConfiguration(clear.as<JsonVariantConst>(),"led-broker-clear"); serviceLedSubscriptions();
+  assert(resultStatus == "saved" && unsubscriptions.size() == 3);
   stopMqtt(); checkpoint("manual-offline");
   std::cout << "Broker-backed MQTT acceptance passed.\n";
 }

@@ -36,6 +36,7 @@ struct MockMqttClient {
 };
 static std::vector<Message> messages;
 static std::vector<std::pair<std::string, int>> subscriptions;
+static std::vector<std::string> unsubscriptions;
 static std::vector<std::string> operations;
 static int nextId = 1, pendingAck = -1;
 #include "../MQTT_Transport.h"
@@ -101,6 +102,13 @@ int esp_mqtt_client_subscribe(esp_mqtt_client_handle_t, const char *topic, int q
   brokerCall(request);
 #endif
   assert(qos == 1); const int id = nextId++; subscriptions.emplace_back(topic, id); return id;
+}
+int esp_mqtt_client_unsubscribe(esp_mqtt_client_handle_t, const char *topic) {
+#ifdef MQTT_BROKER_TEST
+  JsonDocument request; request["op"] = "unsubscribe"; request["topic"] = topic;
+  brokerCall(request);
+#endif
+  unsubscriptions.emplace_back(topic); return nextId++;
 }
 static int send(const char *topic, const char *data, int len, int qos, bool retain, bool synchronous) {
   if (!(synchronous ? publishAccept : enqueueAccept)) return -1;
@@ -384,6 +392,76 @@ int main() {
   homeassistant::Reporting rollover;
   rollover.published(1, UINT32_MAX - 500);
   assert(!rollover.due(2, 498) && rollover.due(2, 499));
-  std::cout << "MQTT tests passed: discovery, count, availability, durable cleanup, reboot recovery, backup broker and rollback.\n";
+  // Exercise the production LED transaction, settings blob and event routing.
+  ::settings = AppSettings(); assert(saveSettings(::settings));
+  ledController.begin(::settings.led); assert(startMqtt(::settings));
+  JsonDocument ledCommand;
+  assert(!deserializeJson(ledCommand,R"({"revision":0,"brightness":128,"groups":[{"group":1,"topics":["sensor/lobby/#","sensor/+/red"]},{"group":2,"topics":["sensor/lobby/#"]}]})"));
+  const size_t beforeLedSubscriptions = subscriptions.size();
+  processLedConfiguration(ledCommand.as<JsonVariantConst>(),"led-save");
+  assert(resultStatus == "saved" && ::settings.revision == 1 && ::settings.led.brightness == 128);
+  assert(subscriptions.size() == beforeLedSubscriptions+2 && ledSubscriptions.pending() == 2);
+  event(MQTT_EVENT_SUBSCRIBED,subscriptions[subscriptions.size()-2].second);
+  event(MQTT_EVENT_SUBSCRIBED,subscriptions.back().second); assert(ledSubscriptions.pending() == 0);
+  ledCommand["brightness"] = 200;
+  processLedConfiguration(ledCommand.as<JsonVariantConst>(),"led-stale");
+  assert(resultStatus == "error" && ::settings.led.brightness == 128);
+  ledCommand["revision"] = 1; Preferences::failWrite = true;
+  processLedConfiguration(ledCommand.as<JsonVariantConst>(),"led-failed-save");
+  assert(resultStatus == "error" && ::settings.revision == 1 && ::settings.led.brightness == 128);
+  Preferences::failWrite = false;
+  data("sensor/lobby/green","100",false); data("sensor/lobby/red","100",false);
+  ledController.service(clockMs,true);
+  assert((ledController.lastFrame()[1] == leds::RGB{255,255,0} && ledController.lastFrame()[5] == leds::RGB{255,255,0}));
+  data("sensor/lobby/blue","100",true); data("sensor/lobby/blue","invalid",false);
+  ledController.service(clockMs,true); assert(ledController.lastFrame()[1].b == 0);
+  data("sensor/lobby/blue","1",false,0,3); data(nullptr,"00",false,1,3);
+  ledController.service(clockMs,true); assert(ledController.lastFrame()[1].b == 255 && commands.empty());
+  const size_t subscriptionsBeforeReconnect = subscriptions.size();
+  event(MQTT_EVENT_DISCONNECTED); event(MQTT_EVENT_CONNECTED); serviceLedSubscriptions();
+  assert(subscriptions.size() == subscriptionsBeforeReconnect+6); // 4 built-in, 2 distinct LED filters
+  ::settings = AppSettings(); assert(loadSettings());
+  assert(::settings.led.brightness == 128 && ::settings.led.topics[0].size() == 2 && ::settings.revision == 1);
+  JsonDocument clearing; clearing["revision"] = 1; clearing["groups"][0]["group"] = 1;
+  clearing["groups"][0]["topics"].to<JsonArray>(); clearing["groups"][1]["group"] = 2;
+  clearing["groups"][1]["topics"].to<JsonArray>();
+  processLedConfiguration(clearing.as<JsonVariantConst>(),"led-clear");
+  clockMs += 5000; serviceLedSubscriptions();
+  assert(resultStatus == "saved" && unsubscriptions.size() == 2 && ledSubscriptions.pending() == 0);
+  // A broad filter cannot route our own status/state/result messages back as LED/control input.
+  JsonDocument broad; broad["revision"] = 2; broad["groups"][0]["group"] = 1;
+  broad["groups"][0]["topics"][0] = "#";
+  processLedConfiguration(broad.as<JsonVariantConst>(),"led-broad");
+  ledController.pause(); ledController.resume();
+  data("bletracker/c6-test/config/ip","100",false);
+  data("bletracker/c6-test/config/result",R"({"id":"own","status":"saved"})",false);
+  data("homeassistant/status","online",true); ledController.service(clockMs,true);
+  assert(commands.empty() && ledController.lastFrame()[1] == leds::RGB{});
+  data("sensor/lobby","100",false); ledController.service(clockMs,true);
+  assert((ledController.lastFrame()[1] == leds::RGB{255,255,255}));
+  JsonDocument reserved; reserved["revision"] = 3; reserved["groups"][0]["group"] = 1;
+  reserved["groups"][0]["topics"][0] = controlPrefix + "/config/set";
+  reserved["groups"][0]["topics"][1] = "homeassistant/status";
+  const size_t beforeReservedSubscriptions = subscriptions.size();
+  processLedConfiguration(reserved.as<JsonVariantConst>(),"led-reserved");
+  assert(resultStatus == "saved" && subscriptions.size() == beforeReservedSubscriptions && ledSubscriptions.pending() == 0);
+  JsonDocument removeReserved; removeReserved["revision"] = 4; removeReserved["groups"][0]["group"] = 1;
+  removeReserved["groups"][0]["topics"].to<JsonArray>();
+  processLedConfiguration(removeReserved.as<JsonVariantConst>(),"led-remove-reserved");
+  for (const auto &filter : unsubscriptions) assert(filter != controlPrefix + "/config/set" && filter != "homeassistant/status");
+  data("bletracker/c6-test/config/get",R"({"id":"still-subscribed"})",false);
+  assert(commands.size() == 1); delete commands.back(); commands.clear();
+  stopMqtt();
+  // Missing LED fields restore defaults, not whatever configuration was in RAM.
+  settingsJson(stored,::settings,true); stored.remove("led"); encoded.clear(); serializeJson(stored,encoded);
+  Preferences::saved.assign(encoded.begin(),encoded.end()); assert(loadSettings());
+  assert(::settings.led.brightness == 255 && leds::filters(::settings.led).empty());
+  stored["led"]["brightness"] = 999; encoded.clear(); serializeJson(stored,encoded);
+  Preferences::saved.assign(encoded.begin(),encoded.end()); assert(!loadSettings() && ::settings.led.brightness == 255);
+  // Oversize LED configuration plus CA fields must preserve the committed blob.
+  AppSettings oversized = ::settings; oversized.mqttCa = std::string(4096,'a'); oversized.otaCa = std::string(4096,'b');
+  for(unsigned i=0;i<64;++i) oversized.led.topics[0].push_back(std::string(155,'a')+std::to_string(i));
+  const auto priorBlob = Preferences::saved; assert(!saveSettings(oversized) && Preferences::saved == priorBlob);
+  std::cout << "MQTT tests passed: discovery, count, availability, durable cleanup, reboot recovery, backup broker, rollback and LED settings/routing.\n";
 }
 #endif

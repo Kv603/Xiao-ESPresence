@@ -17,6 +17,7 @@ struct esp_mqtt_event_t {
   esp_mqtt_error_codes_t *error_handle = nullptr;
 };
 using MqttEventHandler = void (*)(void *, esp_event_base_t, int32_t, void *);
+int esp_mqtt_client_unsubscribe(esp_mqtt_client_handle_t, const char *);
 struct esp_mqtt_client_config_t {
   struct {
     struct { const char *uri = nullptr; } address;

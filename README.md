@@ -1,6 +1,6 @@
 # XIAO ESP32-C6 BLE MQTT tracker
 
-Advertisement-only BLE tracking with Wi-Fi, MQTT/MQTTS, Preferences, MQTT-triggered HTTP/HTTPS OTA, and optional password-protected ArduinoOTA network uploads. No HTTP listener, filesystem, radar, Ethernet, web UI or LED strip is included.
+Advertisement-only BLE tracking with Wi-Fi, MQTT/MQTTS, Preferences, MQTT-triggered HTTP/HTTPS OTA, optional password-protected ArduinoOTA network uploads, and up to 51 WS2812B LEDs driven by LiteLED over RMT.
 
 Can hardcode an always-tracked UUID, such as iBeacon which bypasses the configurable whitelist and distance cutoff, receiving priority in the tracking table and retaining the latest-RSSI low-memory fallback. Configured aliases and matching IRKs still apply. MQTT settings cannot edit this built-in rule. The independent configurable whitelist holds 45 entries; the live tracking table holds 32 devices. BLE reporting follows the  `espresense/devices/<device>/<room>` topic format and JSON format.
 
@@ -8,24 +8,25 @@ BLE declarations and shared types live in `Beacon_Scanner.h`; fingerprinting, fi
 
 ## Build and partition installation
 
-Versions used: Arduino CLI, **Arduino-ESP32 3.3.8**, **NimBLE-Arduino 2.5.1**, **ArduinoJson 7.4.3**. ESP-MQTT, HTTP client, TLS and OTA come from the core. 
+Versions used for the LED firmware: Arduino CLI, **Arduino-ESP32 3.3.12**, **NimBLE-Arduino 2.5.1**, **ArduinoJson 7.4.3**, **LiteLED 3.2.0**. ESP-MQTT, HTTP client, TLS and OTA come from the core.
 Copy `secrets.example.header` to `secrets.h` and fill in credentials.
 
 ```powershell
-arduino-cli core install esp32:esp32@3.3.8
-arduino-cli lib install NimBLE-Arduino@2.5.1 ArduinoJson@7.4.3
-./tools/Install-BoardOptions.ps1
-./tools/Build.ps1 -Partition ble_ota4m
+arduino-cli core install esp32:esp32@3.3.12
+arduino-cli lib install NimBLE-Arduino@2.5.1 ArduinoJson@7.4.3 LiteLED@3.2.0
+./tools/Install-BoardOptions.ps1 -CoreVersion 3.3.12
+arduino-cli compile --jobs 4 --fqbn 'esp32:esp32:XIAO_ESP32C6:FlashSize=4M,PartitionScheme=ble_ota4m,DebugLevel=none' --build-path build/c6-ble_ota4m .
 ./tests/Run.ps1
 ```
 
-Restart Arduino IDE after installing the board options. Select **XIAO_ESP32C6**, then choose **Tools > Reload Board Data**. The IDE saves board-option lists per sketch, so restarting alone can leave the new partition options hidden. Reloading resets board options to their defaults: select 4 MB flash, Core Debug Level **None**, and **Tools > Partition Scheme > BLE: custom (1984 KiB OTA / 84 KiB NVS)** afterwards, and recheck any other desired board settings. The installer adds version-specific `boards.local.txt` and `platform.local.txt` blocks while preserving unrelated settings. Its default core version is the documented 3.3.8. Repeat installation after restoring/updating the core, specifying the installed version for upgrades, for example `./tools/Install-BoardOptions.ps1 -CoreVersion 3.3.12`. The installer reads that version's recipes and refuses missing recipes or conflicting overrides.
+Restart Arduino IDE after installing the board options. Select **XIAO_ESP32C6**, then choose **Tools > Reload Board Data**. The IDE saves board-option lists per sketch, so restarting alone can leave the new partition options hidden. Reloading resets board options to their defaults: select 4 MB flash, Core Debug Level **None**, and **Tools > Partition Scheme > BLE: custom (1984 KiB OTA / 84 KiB NVS)** afterwards, and recheck any other desired board settings. The installer adds version-specific `boards.local.txt` and `platform.local.txt` blocks while preserving unrelated settings. Its legacy default is 3.3.8; specify `-CoreVersion 3.3.12` for this build. Repeat installation after restoring/updating the core. The installer reads that version's recipes and refuses missing recipes or conflicting overrides.
 
 Equivalent CLI compilation:
 
 ```powershell
 arduino-cli compile --jobs 4 --fqbn 'esp32:esp32:XIAO_ESP32C6:FlashSize=4M,PartitionScheme=ble_ota4m,DebugLevel=none' --build-path build/c6-ble_ota4m .
-node tools/verify-image.mjs build/c6-ble_ota4m ble_ota4m
+$image = Get-Item build/c6-ble_ota4m/xiao_espresense_ble-2026-10-06.ino.bin
+if ($image.Length -gt (2031616 - 65536)) { throw 'Application needs at least 64 KiB OTA slot headroom' }
 ```
 
 `build_opt.h` applies size optimization and disables NimBLE C++ logging. The board build flags include `sdkconfig.h` directly to retain the compatible SDK host configuration: forcing observer-only host roles with this core/library pair caused duplicate-host link failures. The application exclusively uses scanning APIs; linker garbage collection removes unused C++ entry points. No installed NimBLE files are modified. A fully pruned host would require rebuilding compatible SDK/library components and is unnecessary for this image's flash budget.
@@ -36,7 +37,7 @@ node tools/verify-image.mjs build/c6-ble_ota4m ble_ota4m
 | `ble_min_spiffs` | 1,966,080 bytes | 20 KiB | Image fits; insufficient worst-case settings storage |
 | `ble_ota4m` | 2,031,616 bytes | 84 KiB | Selected; two OTA slots and Preferences, no filesystem |
 
-The maximum serialized BLE blob is 11,035 bytes. Two configurable 4 KiB PEM roots, credentials and labels also occupy NVS, and blob replacement needs free pages while the previous value remains valid. Preserve whitelist capacity and trust configuration instead of relying on a nearly full 20 KiB NVS partition. The verifier enforces at least 64 KiB application headroom.
+The maximum serialized BLE blob is 11,035 bytes. Two configurable 4 KiB PEM roots, credentials, labels, and LED mappings also occupy NVS, and blob replacement needs free pages while the previous value remains valid. Preserve whitelist capacity and trust configuration instead of relying on a nearly full 20 KiB NVS partition. Keep at least 64 KiB application headroom with the size check above.
 
 The custom table is `config/partitions/xiao_ble_ota4m.csv`: NVS `0x9000–0x1dfff`, OTA metadata `0x1e000–0x1ffff`, app0 `0x20000–0x20ffff`, app1 `0x210000–0x3fffff`. Arduino 3.3.8 otherwise hardcodes `0xe000` and `0x10000` in upload/merge recipes. The installer parameterizes those addresses, retaining stock defaults for other board profiles. Do not copy the CSV alone and assume the uploader will follow it. Do not add a root `partitions.csv` that silently overrides the menu.
 
@@ -119,6 +120,56 @@ When Wi-Fi first obtains an IP address and whenever it reconnects, explicit/save
 
 The immutable always-tracked list is reported separately from `entries`. BLE edits cannot remove its exemption. Existing `bletracking/config` blobs and legacy `mmW32` room/label/broker-host keys are read compatibly. New connection settings use a single versioned `tracker/settings` blob. Failed writes leave active settings unchanged; corrupted saved settings are not silently overwritten.
 
+## WS2812B LED groups
+
+The strip uses LiteLED 3.2.0's RMT driver, WS2812 timing and GRB order. Connect DIN to **D2/GPIO2** by default, using a suitable strip power supply and a common ground. Set these defines in `secrets.h` or compiler flags; each has a default in `LED_Core.h`:
+
+| Define | Default | Meaning |
+|---|---:|---|
+| `LED_STRIP_PIN` | 2 | Strip DIN GPIO |
+| `LED_STRIP_COUNT` | 51 | Physical pixel count, 1–51 |
+| `LED_SKIP_FIRST` | 1 | Keep pixel 0 black; use 0 to include it |
+| `LED_GROUP_WIDTH` | 3 | Positive number of pixels per group |
+| `LED_GROUP_GAP` | 1 | Nonnegative number of black pixels between groups |
+
+Groups are numbered from **1**. Physical pixels are numbered from **0**. A group's first pixel is `LED_SKIP_FIRST + (group - 1) * (LED_GROUP_WIDTH + LED_GROUP_GAP)`. The final group may be shorter. Defaults yield 13 groups: group 1 uses pixels 1–3, group 2 uses 5–7, and group 13 uses 49–50. Pixel 0 and every gap stay black. Startup is off; general brightness defaults to 255. Before reducing the group count in a new build, clear mappings for removed groups: saved out-of-range groups fail settings validation.
+
+Read `/config/get` for the current settings `revision`, then send a non-retained JSON command to `bletracker/<nodeId>/config/set`:
+
+```json
+{"id":"led-1","operation":"led","revision":0,"brightness":200,"groups":[{"group":1,"topics":["sensor/lobby/#","house/alert"]},{"group":13,"topics":["sensor/door/+"]}]}
+```
+
+`brightness` is LiteLED's general **0–255** brightness and multiplies all group output. Omitted fields stay unchanged. Each listed group replaces its filter list; `topics:[]` clears that group. Unlisted groups retain their mappings. Brightness and mappings share the existing revision and settings blob, survive reboot, and activate only after a successful save. Live values and channel overrides start off after reboot.
+
+Filters accept MQTT `+` and `#` wildcards. `sensor/lobby/#` matches `sensor/lobby`, `sensor/lobby/mmwave`, and descendants such as `sensor/lobby/nested/blue`. `+` matches exactly one level, including an empty level. Topic/filter matching is case-sensitive; root wildcards do not match `$` topics. Shared-subscription filters (`$share/...`) are not supported. A filter may feed several groups; overlapping filters update a group once per received message. Distinct filters subscribe once at QoS 1, with retry and reconnection replay. The node's own control prefix and `homeassistant/status` always use their normal handlers and never feed the LEDs.
+
+Only the final suffixes `/red`, `/green`, and `/blue` select a channel for numeric payloads. All other suffixes are ignored when choosing the event behavior; the payload is processed normally. For a group subscribed to `motion/woodshopdoor/#`, both `motion/woodshopdoor` and `motion/woodshopdoor/human` accept a numeric percentage as white or a color-name payload at 75%. `motion/woodshopdoor/blue` with a numeric payload updates only blue. Each concrete topic remains an independent source for normal mixing.
+
+On ordinary matched topics:
+
+- A finite numeric payload **0–100**, including fractions, contributes white at that percentage. It replaces the previous contribution from that concrete topic.
+- A color name, as plain text or a JSON string, is trimmed and converted to lowercase. The lookup supports the [CSS named colors](https://www.w3.org/TR/css-color-4/#named-colors), `on` as white, `off` as black, and `brickred` as firebrick (`#B22222`). Named colors start at **75%**. CSS `green` is `#008000`; use `lime` for full-intensity green.
+- Contributions from different concrete topics add, with each RGB channel capped at 255 before general strip brightness. `off`, `black`, and numeric zero clear only that source.
+- Each non-red source fades linearly from its received level to zero over **60 seconds**. A new message restarts only that source's fade. Only the names `red` and `brickred` persist; `firebrick` fades normally.
+
+Numeric messages on topics ending exactly in **`/red`, `/green`, or `/blue`** replace that group's corresponding channel with `round(255 * percentage / 100)`, preserving its other channels and their timers. For example:
+
+```text
+sensor/lobby/green  -> 100   # (0,255,0)
+sensor/lobby/red    -> 100   # (255,255,0), preserving green
+sensor/lobby/blue   -> 50    # (255,255,128)
+sensor/lobby/red    -> 0     # clears only red
+```
+
+Channel overrides apply after ordinary topic mixing. Red persists; green and blue overrides independently fade to zero over 60 seconds. An override remains active at zero, so an older mixed channel does not reappear. The next ordinary numeric or named-color message clears all overrides for its matching groups and resumes normal source mixing. A color-name payload on `/red`, `/green`, or `/blue` is an ordinary color message.
+
+Retained LED values are ignored. Payloads are at most 64 bytes; concrete topic names and filters are at most 160 bytes. There are at most 64 group/filter assignments and 64 live ordinary concrete sources. Expired or unreferenced source slots are reused. The separate 32-event FIFO preserves message order; excess events or new sources at capacity are rejected and counted. Unknown colors, malformed numbers, and out-of-range values leave output unchanged. The existing 16,000-byte settings limit also applies, so a large mapping plus CA certificates can exceed it and fail atomically.
+
+`/config/get` includes `led` brightness/mappings, layout, `driver_ready`, `driver_error`, `driver_failures`, `subscriptions_pending`, `queued_events`, `event_overflow`, `source_overflow`, and `invalid_values`. Rendering runs at up to 50 Hz while BLE/Home Assistant keep their approximately one-second service cadence. LED fades are also serviced during broker/acknowledgment waits. Both OTA paths clear transient LED state and turn the strip off; failed updates resume with LEDs off until new messages arrive.
+
+Physical acceptance remains separate from compilation: verify red/green/blue order, pixel 0 and gaps staying black, group 13's two pixels, global brightness 0 then 255, additive topics, `/green` followed by `/red`, and 60-second fades while BLE/Wi-Fi are active. Check OTA entry turns the strip off. No flashing is performed by the native tests.
+
 ## OTA
 
 Standard ArduinoOTA is enabled by default (`ARDUINO_OTA=1`). Set `ARDUINO_OTA_PASSWORD` in private `secrets.h`; the existing `HTTP_PASS` is used as a compatibility fallback. With neither a nonempty dedicated password nor a nonempty fallback, the service stays disabled. Define `ARDUINO_OTA 0` to compile it out.
@@ -141,7 +192,7 @@ An interrupted download leaves the active application selected. This does not pr
 
 ## Tests
 
-`tests/Run.ps1` runs the preserved BLE core/runtime regression suite, 12,000 RSSI equivalence observations, configuration persistence/failure tests and MQTT fragment/URL validation. It also tests the 15-second reportable-device count, count coalescing and refresh, discovery/availability messages, subscription acknowledgments, shutdown and room-change rollback. The current tests live outside build output. Old reports in `docs/` and old `build/` artifacts describe the previous multi-board/web firmware.
+`tests/Run.ps1` runs the preserved BLE core/runtime regression suite, 12,000 RSSI equivalence observations, configuration persistence/failure tests and MQTT fragment/URL validation. It also tests the 15-second reportable-device count, count coalescing and refresh, discovery/availability messages, subscription acknowledgments, shutdown and room-change rollback. LED tests cover alternate layouts, wildcard matching, colors/numbers, additive mixing, channel overrides, independent decay and rollover, FIFO/capacity limits, subscriptions, and the production LED settings transaction and event routing. The current tests live outside build output. Old reports in `docs/` and old `build/` artifacts describe the previous multi-board/web firmware.
 
 The MQTT tests use the production settings serializer/loader with simulated NVS, including reset recovery, cleanup-write failure, backup-broker room changes and rollback. `tests/Test-BoardOptions.ps1` checks default 3.3.8 and explicit 3.3.12 installation in isolated fixture directories, preserving unrelated overrides and patching all required flash addresses.
 
