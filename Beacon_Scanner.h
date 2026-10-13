@@ -3,6 +3,10 @@
 #include <ArduinoJson.h>
 #include <cstdint>
 #include <string>
+#ifndef TRACKER_NATIVE_TEST
+#include "secrets.h"
+#endif
+
 
 // BLE scanner entry points used by the application and OTA flow.
 void setupBLE(bool active);
@@ -11,6 +15,8 @@ void pauseBLEForOTA();
 void requestActiveBLEScan();
 bool bleScannerIsRunning();
 bool bleConfigurationRevision(uint32_t &revision);
+bool bleReportableDeviceCount(uint32_t &count);
+std::string bleRoomTopicName(const std::string &room, const std::string &node);
 bool appendBLEConfigurationState(JsonDocument &doc);
 const char *editBLEConfiguration(JsonVariantConst command);
 bool prepareForFirmwareUpdate();

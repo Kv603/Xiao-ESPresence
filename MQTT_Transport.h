@@ -1,8 +1,15 @@
 #pragma once
 #include <mqtt_client.h>
+#include <esp_system.h>
 #include <atomic>
 #include <freertos/queue.h>
+#include <vector>
 #include "Control_Core.h"
+#include "Beacon_Scanner.h"
+#include "Home_Assistant.h"
+#ifndef TRACKER_NATIVE_TEST
+#include "secrets.h"
+#endif
 
 struct Command {
   std::string topic, payload;
@@ -11,6 +18,8 @@ static QueueHandle_t commandQueue = nullptr;
 static std::string nodeId, controlPrefix;
 static std::atomic<bool> mqttOnline{ false }, mqttAnnounce{ false };
 static std::atomic<bool> mqttReselect{ false };
+static std::atomic<bool> mqttStopping{ false }, haReplay{ false }, haNewConnection{ false };
+static std::atomic<bool> haClearStatus{ false };
 static std::atomic<int> mqttLastAck{ -1 };
 static std::atomic<unsigned> mqttSubscriptions{ 0 };
 static std::atomic<unsigned> droppedCommands{ 0 };
@@ -18,6 +27,73 @@ static esp_mqtt_client_handle_t mqttHandle = nullptr;
 static control::Assembly incoming;
 static AppSettings transportSettings;     // Own certificate memory for client's full lifetime.
 static char selectedMqttServer[40] = {};  // 39 name bytes plus the terminating NUL.
+static homeassistant::Topics haTopics;
+static homeassistant::Reporting haReporting;
+static homeassistant::Birth haBirth;
+static bool haDiscoveryPending = false;
+static int controlSubscriptionIds[3] = { -1, -1, -1 };
+static unsigned controlSubscriptionMask = 0;  // Owned by the MQTT event task.
+// The settings blob is the authoritative journal, restored by loadSettings().
+static auto &haRetiredDiscovery = settings.discoveryCleanup;
+static uint32_t haNextCleanup = 0;
+inline bool waitForAck(int id, uint32_t timeout = 5000);
+
+
+
+////////////////////////////////////////////
+inline std::string logbootreason(void) {
+  std::string BootReasonText = "Unknown Reboot";
+  esp_reset_reason_t reason = esp_reset_reason();
+  switch (reason) {
+    case ESP_RST_POWERON:
+      BootReasonText = "Power-on boot";
+      log_w("Reset due to power-on event");
+      break;
+    case ESP_RST_SW:
+      BootReasonText = "Soft Reboot";
+      log_w("Software reset via esp_restart");
+      break;
+    case ESP_RST_PANIC:
+      BootReasonText = "Panic Reboot";
+      log_w("Software reset due to exception/panic");
+      break;
+    case ESP_RST_INT_WDT:
+      BootReasonText = "IRQ Watchdog";
+      log_w("Reset (software or hardware) due to interrupt watchdog");
+      break;
+    case ESP_RST_TASK_WDT:
+      BootReasonText = "Task Watchdog";
+      log_w("Reset due to task watchdog");
+      break;
+    case ESP_RST_WDT:
+      BootReasonText = "Other Watchdog";
+      log_w("Reset due to other watchdogs");
+      break;
+    case ESP_RST_DEEPSLEEP:
+      BootReasonText = "Deep Reboot";
+      log_w("Reset after exiting deep sleep mode");
+      break;
+    case ESP_RST_BROWNOUT:
+      BootReasonText = "Brownout Boot";
+      log_w("Brownout reset (software or hardware)");
+      break;
+    case ESP_RST_SDIO:
+      BootReasonText = "Reset over SDIO";
+      log_w("Reset over SDIO");
+      break;
+
+    default:
+      break;
+  }
+  log_w("reboot reason '%s'", BootReasonText.c_str());
+  return (BootReasonText);
+}
+
+////////////////////////////////////////////////
+inline int publishHaOnline() {
+  if (!mqttHandle || !mqttOnline || mqttStopping) return -1;
+  return esp_mqtt_client_enqueue(mqttHandle, haTopics.status.c_str(), "online", 6, 1, false, false);
+}
 
 inline void selectMqttServer(const std::string &uri) {
   const size_t scheme = uri.find("://");
@@ -40,11 +116,16 @@ inline void selectMqttServer(const std::string &uri) {
 
 struct MqttAdapter {
   bool connected() const {
-    return mqttOnline.load();
+    return mqttOnline.load() && !mqttStopping.load();
   }
   int publish(const char *topic, uint8_t qos, bool retain, const char *payload, size_t n) {
     if (!mqttHandle || !connected()) return 0;
-    const int result = esp_mqtt_client_enqueue(mqttHandle, topic, payload, int(n), qos, retain, false);
+    // ESP-MQTT rejects QoS 0 enqueue unless storage is explicitly requested.
+    const int result = esp_mqtt_client_enqueue(mqttHandle, topic, payload, int(n), qos, retain, qos == 0);
+
+    if (-2 == result) log_w("Outbox full publishing %d bytes to topic '%s, returned %d'", int(n), topic, result);
+    if (-1 == result) log_w("Failed publishing %d bytes to topic '%s, returned %d'", int(n), topic, result);
+
     return result >= 0 ? result + 1 : 0;  // ESP-MQTT uses zero for successful QoS 0.
   }
 } mqttClient;
@@ -61,13 +142,26 @@ static void mqttEvent(void *, esp_event_base_t, int32_t eventId, void *eventData
       }
       mqttOnline = true;
       mqttReselect = false;
+      if (mqttStopping) break;
       mqttAnnounce = true;
+      haNewConnection = true;
+      haReplay = true;
       mqttSubscriptions = 0;
-      esp_mqtt_client_subscribe(mqttHandle, (controlPrefix + "/config/set").c_str(), 1);
-      esp_mqtt_client_subscribe(mqttHandle, (controlPrefix + "/config/get").c_str(), 1);
-      esp_mqtt_client_subscribe(mqttHandle, (controlPrefix + "/ota/set").c_str(), 1);
+      controlSubscriptionMask = 0;
+      controlSubscriptionIds[0] = esp_mqtt_client_subscribe(mqttHandle, (controlPrefix + "/config/set").c_str(), 1);
+      controlSubscriptionIds[1] = esp_mqtt_client_subscribe(mqttHandle, (controlPrefix + "/config/get").c_str(), 1);
+      controlSubscriptionIds[2] = esp_mqtt_client_subscribe(mqttHandle, (controlPrefix + "/ota/set").c_str(), 1);
+      esp_mqtt_client_subscribe(mqttHandle, "homeassistant/status", 1);
+      // Delete stale retained offline before sending the requested live birth.
+      haClearStatus = esp_mqtt_client_enqueue(mqttHandle, haTopics.status.c_str(), "", 0, 1, true, false) < 0;
+      publishHaOnline();
       break;
     case MQTT_EVENT_DISCONNECTED:
+      mqttOnline = false;
+      mqttReselect = !mqttStopping.load();
+      mqttAnnounce = false;
+      incoming.reset();
+      haBirth.reset();
       Serial.printf("MQTT to '%s' disconnected\n", selectedMqttServer);
       {
         IPAddress test;
@@ -77,7 +171,15 @@ static void mqttEvent(void *, esp_event_base_t, int32_t eventId, void *eventData
       }
       break;
 
-    case MQTT_EVENT_SUBSCRIBED: ++mqttSubscriptions; break;
+    case MQTT_EVENT_SUBSCRIBED:
+      for (unsigned i = 0; i < 3; ++i) {
+        const unsigned bit = 1U << i;
+        if (controlSubscriptionIds[i] >= 0 && e->msg_id == controlSubscriptionIds[i] && !(controlSubscriptionMask & bit)) {
+          controlSubscriptionMask |= bit;
+          ++mqttSubscriptions;
+        }
+      }
+      break;
     case MQTT_EVENT_PUBLISHED: mqttLastAck = e->msg_id; break;
     case MQTT_EVENT_ERROR:
       if (e->error_handle) Serial.printf("MQTT error type=%d transport=%d socket=%d refused=%d,server=%s\n",
@@ -92,6 +194,13 @@ static void mqttEvent(void *, esp_event_base_t, int32_t eventId, void *eventData
       }
       break;
     case MQTT_EVENT_DATA:
+      if (mqttStopping) break;
+      if (!e->current_data_offset) haBirth.reset();
+      if (haBirth.accepts(e->topic, e->topic_len, e->current_data_offset)) {
+        incoming.reset();
+        if (haBirth.add(e->data, e->data_len, e->current_data_offset, e->total_data_len)) haReplay = true;
+        break;
+      }
       if (incoming.add(e->topic, e->topic_len, e->data, e->data_len, e->current_data_offset, e->total_data_len, e->retain)) {
         auto *command = new (std::nothrow) Command{ incoming.topic(), incoming.body() };
         if (!command || xQueueSend(commandQueue, &command, 0) != pdTRUE) {
@@ -105,7 +214,15 @@ static void mqttEvent(void *, esp_event_base_t, int32_t eventId, void *eventData
   }
 }
 inline void stopMqtt() {
+  mqttStopping = true;
   if (mqttHandle) {
+    if (mqttOnline) {
+      // Put offline after earlier announcements in the MQTT task's outbox.
+      // Sending it synchronously could let an older queued retained-clear
+      // message run afterwards and erase the offline state again.
+      const int id = esp_mqtt_client_enqueue(mqttHandle, haTopics.status.c_str(), "offline", 7, 1, true, false);
+      if (!waitForAck(id, 2000)) Serial.println("MQTT offline announcement not acknowledged; stopping client");
+    }
     esp_mqtt_client_stop(mqttHandle);
     esp_mqtt_client_destroy(mqttHandle);
     mqttHandle = nullptr;
@@ -115,23 +232,35 @@ inline void stopMqtt() {
   mqttReselect = false;
   mqttLastAck = -1;
   mqttSubscriptions = 0;
+  haReplay = false;
+  haNewConnection = false;
+  haClearStatus = false;
+  haDiscoveryPending = false;
+  haBirth.reset();
   incoming.reset();
 }
 inline bool startMqtt(const AppSettings &s) {
   stopMqtt();
   transportSettings = s;
+  haTopics = homeassistant::Topics(nodeId, bleRoomTopicName(s.room, nodeId));
+  haNextCleanup = millis();
   selectMqttServer(transportSettings.uri);
   esp_mqtt_client_config_t config{};
   config.broker.address.uri = transportSettings.uri.c_str();
   if (s.uri.compare(0, 8, "mqtts://") == 0) {
     if (s.mqttCa.empty() || time(nullptr) < 1704067200) return false;
     config.broker.verification.certificate = transportSettings.mqttCa.c_str();
-    config.broker.verification.skip_cert_common_name_check=true;
+    config.broker.verification.skip_cert_common_name_check = true;
   }
   config.credentials.client_id = nodeId.c_str();
   config.credentials.username = transportSettings.user.c_str();
   config.credentials.authentication.password = transportSettings.password.c_str();
   config.session.keepalive = 30;
+  config.session.last_will.topic = haTopics.status.c_str();
+  config.session.last_will.msg = "offline";
+  config.session.last_will.msg_len = 7;
+  config.session.last_will.qos = 1;
+  config.session.last_will.retain = true;
   config.network.timeout_ms = 10000;
   config.network.reconnect_timeout_ms = 5000;
   config.buffer.size = 1024;
@@ -139,23 +268,102 @@ inline bool startMqtt(const AppSettings &s) {
   config.outbox.limit = 8192;
   mqttHandle = esp_mqtt_client_init(&config);
   if (!mqttHandle) return false;
+  mqttStopping = false;
   if (esp_mqtt_client_register_event(mqttHandle, MQTT_EVENT_ANY, mqttEvent, nullptr) != ESP_OK || esp_mqtt_client_start(mqttHandle) != ESP_OK) {
     stopMqtt();
     return false;
   }
+
+  std::string bootreason = logbootreason();
+  esp_mqtt_client_enqueue(mqttHandle, haTopics.bootreason.c_str(), bootreason.c_str(), bootreason.length(), 1, false, false);
   return true;
 }
+
+
+///////////////////////
 inline int publishJson(const char *suffix, const JsonDocument &doc, int qos = 1) {
   if (!mqttHandle || !mqttOnline || doc.overflowed()) return -1;
   std::string payload;
   serializeJson(doc, payload);
-  return esp_mqtt_client_enqueue(mqttHandle, (controlPrefix + suffix).c_str(), payload.c_str(), int(payload.size()), qos, false, false);
+  return esp_mqtt_client_enqueue(mqttHandle, (controlPrefix + suffix).c_str(), payload.c_str(), int(payload.size()), qos, false, qos == 0);
 }
-inline bool waitForAck(int id, uint32_t timeout = 5000) {
+inline bool waitForAck(int id, uint32_t timeout) {
   const uint32_t start = millis();
   while (id >= 0 && mqttOnline && uint32_t(millis() - start) < timeout) {
     if (mqttLastAck == id) return true;
     delay(10);
   }
   return false;
+}
+
+// Stage the tombstone in the candidate before saving. The room and its cleanup
+// journal must commit in a single NVS write, including across sudden resets.
+inline bool retireHaDiscovery(const AppSettings &previous, AppSettings &current) {
+  const homeassistant::Topics oldTopics(nodeId, bleRoomTopicName(previous.room, nodeId));
+  const homeassistant::Topics newTopics(nodeId, bleRoomTopicName(current.room, nodeId));
+  if (oldTopics.discovery != newTopics.discovery) {
+    bool found = false;
+    for (const auto &old : current.discoveryCleanup)
+      if (old.broker == transportSettings.uri && old.topic == oldTopics.discovery) found = true;
+    if (!found) {
+      if (current.discoveryCleanup.size() >= homeassistant::MAX_RETIRED_DISCOVERY) return false;
+      current.discoveryCleanup.push_back({ transportSettings.uri, oldTopics.discovery });
+    }
+  }
+  return true;
+}
+
+inline void serviceHomeAssistant(const std::string &label, const char *firmware) {
+  if (!mqttHandle || !mqttOnline || mqttStopping) return;
+  if (haClearStatus) {
+    if (esp_mqtt_client_enqueue(mqttHandle, haTopics.status.c_str(), "", 0, 1, true, false) < 0) return;
+    haClearStatus = false;
+  }
+  if (haNewConnection.exchange(false)) haReporting.reset();
+  if (haReplay.exchange(false)) {
+    haDiscoveryPending = true;
+    haReporting.replay = true;
+  }
+  const uint32_t now = millis();
+  if (int32_t(now - haNextCleanup) >= 0) {
+    for (size_t index = 0; index < haRetiredDiscovery.size();) {
+      const auto &old = haRetiredDiscovery[index];
+      if (old.broker != transportSettings.uri) {
+        ++index;
+        continue;
+      }
+      // A room can be renamed back before a failed cleanup was retried.
+      if (old.topic != haTopics.discovery) {
+        const int id = esp_mqtt_client_publish(mqttHandle, old.topic.c_str(), "", 0, 1, true);
+        if (!waitForAck(id, 2000)) {
+          haNextCleanup = millis() + 5000;
+          break;
+        }
+      }
+      AppSettings cleaned = settings;
+      cleaned.discoveryCleanup.erase(cleaned.discoveryCleanup.begin() + index);
+      if (!saveSettings(cleaned)) {
+        // Keep the durable record on failure; repeating a tombstone is safe.
+        haNextCleanup = millis() + 5000;
+        break;
+      }
+      haRetiredDiscovery.swap(cleaned.discoveryCleanup);
+    }
+  }
+  if (!mqttOnline || mqttStopping) return;
+  if (haDiscoveryPending) {
+    JsonDocument doc;
+    homeassistant::discoveryJson(doc, haTopics, label, nodeId, firmware);
+    if (doc.overflowed()) return;
+    std::string payload;
+    serializeJson(doc, payload);
+    if (esp_mqtt_client_enqueue(mqttHandle, haTopics.discovery.c_str(), payload.c_str(), int(payload.size()), 1, true, false) < 0) return;
+    haDiscoveryPending = false;
+  }
+  uint32_t count;
+  if (!bleReportableDeviceCount(count) || !haReporting.due(count, millis())) return;
+  if (publishHaOnline() < 0) return;
+  const std::string payload = std::to_string(count);
+  if (esp_mqtt_client_enqueue(mqttHandle, haTopics.count.c_str(), payload.c_str(), int(payload.size()), 1, false, false) >= 0)
+    haReporting.published(count, millis());
 }
